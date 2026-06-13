@@ -46,21 +46,43 @@ class MambaSimple(nn.Module):
         self.use_fast_path = False # DO NOT USE FAST PATH for quantization experiments
         self.layer_idx = originalLayer.layer_idx
         self.use_had_transform = use_had_transform
-        
-        # input proj
+
+        # input proj: split into separate projs
         if use_had_transform:
-            self.in_proj = HadLinear(originalLayer.in_proj, input_transform=True, output_transform=False)
+            self.in_proj_states = HadLinear(originalLayer.in_proj, input_transform=True, output_transform=False)
+            self.in_proj_states.weight.data = self.in_proj_states.weight.data[:self.d_inner]
+            self.in_proj_states.out_features = self.d_inner
+            self.in_proj_gates = HadLinear(originalLayer.in_proj, input_transform=True, output_transform=False)
+            self.in_proj_gates.weight.data = self.in_proj_gates.weight.data[-self.d_inner:]
+            self.in_proj_gates.out_features = self.d_inner
         else:
-            self.in_proj = copy.deepcopy(originalLayer.in_proj)
+            self.in_proj_states = copy.deepcopy(originalLayer.in_proj)
+            self.in_proj_states.weight.data = self.in_proj_states.weight.data[:self.d_inner]
+            self.in_proj_states.out_features = self.d_inner
+            self.in_proj_gates = copy.deepcopy(originalLayer.in_proj)
+            self.in_proj_gates.weight.data = self.in_proj_gates.weight.data[-self.d_inner:]
+            self.in_proj_gates.out_features = self.d_inner
+
         # causal conv
         self.conv1d = copy.deepcopy(originalLayer.conv1d)
         self.activation = "silu"
         self.act = nn.SiLU()
-        # B, C, dt
-        self.x_proj = copy.deepcopy(originalLayer.x_proj)
+
+        # B, C, dt: split into separate projs
+        self.x_proj_dt = copy.deepcopy(originalLayer.x_proj)
+        self.x_proj_dt.weight.data = self.x_proj_dt.weight.data[:-2*self.d_state]
+        self.x_proj_dt.out_features = self.dt_rank
+
+        self.x_proj_b = copy.deepcopy(originalLayer.x_proj)
+        self.x_proj_b.weight.data = self.x_proj_b.weight.data[-2*self.d_state:-self.d_state]
+        self.x_proj_b.out_features = self.d_state
+        self.x_proj_c = copy.deepcopy(originalLayer.x_proj)
+        self.x_proj_c.weight.data = self.x_proj_c.weight.data[-self.d_state:]
+        self.x_proj_c.out_features = self.d_state
         self.dt_proj = copy.deepcopy(originalLayer.dt_proj)
         self.dt_proj.bias = None
         self.dt_proj_bias = originalLayer.dt_proj.bias.clone().float()
+
         # ascan
         self.A_log = copy.deepcopy(originalLayer.A_log)
         self.D = copy.deepcopy(originalLayer.D)
@@ -78,7 +100,7 @@ class MambaSimple(nn.Module):
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
-        
+
         #assert hidden_states.shape[0] == 1, "Current only support bsz=1"
         batch, seqlen, dim = hidden_states.shape
 
@@ -89,13 +111,12 @@ class MambaSimple(nn.Module):
                 # The states are updated inplace
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
-            
-        #NOTE(brian1009): Simplified of original implementation 
+
+        #NOTE(brian1009): Simplified of original implementation
         # https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py#L134
-        xz = self.in_proj(hidden_states) #(B, L, 2*D)
-        xz = rearrange(xz, "b l d -> b d l") 
-        x, z = xz.chunk(2, dim=1) #(B, D, L), #(B, D, L)
-        
+        x = self.in_proj_states(hidden_states).transpose(1, 2)
+        z = self.in_proj_gates(hidden_states).transpose(1, 2)
+
         # Compute short convolution
         if conv_state is not None:
             # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
@@ -106,9 +127,10 @@ class MambaSimple(nn.Module):
         x = self.act(x[...,:seqlen])
         #NOTE(brian1009): 2024/03/27 Do not squeeze the dimension of (b l), to make sure that QAct will always take the input dimension of (b, l, d)
         x_reshape = rearrange(x, "b d l -> b l d")
-        x_dbl = self.x_proj(x_reshape)  # (bl d)
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        
+        dt = self.x_proj_dt(x_reshape)
+        B = self.x_proj_b(x_reshape)
+        C = self.x_proj_c(x_reshape)
+
         #NOTE(brian1009): Comment this line and do the inference directly with the forward in the module
         dt = self.dt_proj(dt)
 
@@ -116,7 +138,7 @@ class MambaSimple(nn.Module):
         dt = rearrange(dt, "b l d -> b d l", l=seqlen)
         B = rearrange(B, "b l dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "b l dstate -> b dstate l", l=seqlen).contiguous()
-        
+
         assert self.activation in ["silu", "swish"]
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         y = selective_scan_fn(
@@ -137,7 +159,7 @@ class MambaSimple(nn.Module):
             y, last_state = y
             ssm_state.copy_(last_state)
             ssm_state = self.ssm_state_act(ssm_state)
-        y = rearrange(y, "b d l -> b l d") 
+        y = rearrange(y, "b d l -> b l d")
         y = self.had(y)
         out = self.out_proj(y)
         return out
@@ -146,8 +168,8 @@ class MambaSimple(nn.Module):
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 
-        xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-        x, z = xz.chunk(2, dim=-1)  # (B D)
+        x = self.in_proj_states(hidden_states.squeeze(1))
+        z = self.in_proj_gates (hidden_states.squeeze(1))
 
         # Conv step
         if causal_conv1d_update is None:
@@ -167,8 +189,9 @@ class MambaSimple(nn.Module):
                 self.activation,
             )
 
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.x_proj_dt(x)
+        B = self.x_proj_b(x)
+        C = self.x_proj_c(x)
 
         dt = self.dt_proj(dt)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
@@ -261,7 +284,8 @@ class W4A16QMamba(nn.Module):
         self.layer_idx = layer_idx
         assert bias is False, "Only support bias=False for now"
 
-        self.in_proj = W4A16B16O16Linear(self.d_model, self.d_inner * 2, group_size=128)
+        self.in_proj_states = W4A16B16O16Linear(self.d_model, self.d_inner, group_size=128)
+        self.in_proj_gates = W4A16B16O16Linear(self.d_model, self.d_inner, group_size=128)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
@@ -276,9 +300,9 @@ class W4A16QMamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = W4A16B16O16Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, group_size=128
-        )
+        self.x_proj_dt = W4A16B16O16Linear(self.d_inner, self.dt_rank, group_size=128)
+        self.x_proj_b = W4A16B16O16Linear(self.d_inner, self.d_state, group_size=128)
+        self.x_proj_c = W4A16B16O16Linear(self.d_inner, self.d_state, group_size=128)
         # we seperate the bias, so we set bias=False here
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=False, **factory_kwargs)
         self.register_buffer("dt_proj_bias", torch.empty(
@@ -327,7 +351,7 @@ class W4A16QMamba(nn.Module):
 
     @classmethod
     def from_fp16(cls, originalLayer: Mamba, use_had_transform: bool = True):
-        
+
         qmixer = cls(
             d_model=originalLayer.d_model,
             d_state=originalLayer.d_state,
@@ -340,20 +364,25 @@ class W4A16QMamba(nn.Module):
             device=torch.device("cuda"),
             dtype=torch.float16,
         )
-        
-        # input proj, weight group_size=128
-        qmixer.in_proj = W4A16B16O16Linear.from_fp16(
-            originalLayer=copy.deepcopy(originalLayer.in_proj),
+
+        # input proj, weight group_size=128 (split into states/gates)
+        qmixer.in_proj_states = W4A16B16O16Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.in_proj_states),
+        )
+        qmixer.in_proj_gates = W4A16B16O16Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.in_proj_gates),
         )
         # causal conv
         qmixer.conv1d = copy.deepcopy(originalLayer.conv1d)
         qmixer.activation = "silu"
         qmixer.act = nn.SiLU()
-        # B, C, dt
-        qmixer.x_proj = W4A16B16O16Linear.from_fp16(copy.deepcopy(originalLayer.x_proj))
+        # B, C, dt (split into separate projs)
+        qmixer.x_proj_dt = W4A16B16O16Linear.from_fp16(copy.deepcopy(originalLayer.x_proj_dt))
+        qmixer.x_proj_b = W4A16B16O16Linear.from_fp16(copy.deepcopy(originalLayer.x_proj_b))
+        qmixer.x_proj_c = W4A16B16O16Linear.from_fp16(copy.deepcopy(originalLayer.x_proj_c))
         # We use FP16 dt_proj, becuase w4a16o16 does not support M=bsize, K=48, N=1536
         qmixer.dt_proj = copy.deepcopy(originalLayer.dt_proj)
-        qmixer.dt_proj_bias = originalLayer.dt_proj_bias.clone() # MambaSimple has separated bias 
+        qmixer.dt_proj_bias = originalLayer.dt_proj_bias.clone() # MambaSimple has separated bias
         # ascan
         qmixer.A_log = copy.deepcopy(originalLayer.A_log)
         qmixer.D = copy.deepcopy(originalLayer.D)
@@ -372,7 +401,7 @@ class W4A16QMamba(nn.Module):
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
-        
+
         #assert hidden_states.shape[0] == 1, "Current only support bsz=1"
         batch, seqlen, dim = hidden_states.shape
 
@@ -383,12 +412,10 @@ class W4A16QMamba(nn.Module):
                 # The states are updated inplace
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
-            
-        # xz = self.in_proj(hidden_states) #(B, 2*D, L)
-        # xz = rearrange(xz, "b l d -> b d l")
-        xz = self.in_proj.to_seqlen_last(hidden_states) #(B, 2*D, L)
-        x, z = xz.chunk(2, dim=1) #(B, D, L), #(B, D, L)
-        
+
+        x = self.in_proj_states.to_seqlen_last(hidden_states) #(B, D, L)
+        z = self.in_proj_gates.to_seqlen_last(hidden_states) #(B, D, L)
+
         # Compute short convolution
         if conv_state is not None:
             # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
@@ -405,14 +432,15 @@ class W4A16QMamba(nn.Module):
 
         # we need a contiguous here for W4A16B16O16
         x_reshape = rearrange(x, "b d l -> (b l) d").contiguous()
-        x_dbl = self.x_proj(x_reshape)  # (bl d)
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        
+        dt = self.x_proj_dt(x_reshape)
+        B = self.x_proj_b(x_reshape)
+        C = self.x_proj_c(x_reshape)
+
         dt = self.dt_proj.weight @ dt.t()
         dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        
+
         assert self.activation in ["silu", "swish"]
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         y = selective_scan_fn(
@@ -432,7 +460,7 @@ class W4A16QMamba(nn.Module):
         if ssm_state is not None:
             y, last_state = y
             ssm_state.copy_(last_state)
-        y = rearrange(y, "b d l -> b l d") 
+        y = rearrange(y, "b d l -> b l d")
         y = self.had(y)
         out = self.out_proj(y)
         return out
@@ -440,8 +468,8 @@ class W4A16QMamba(nn.Module):
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
-        xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-        x, z = xz.chunk(2, dim=-1)  # (B D)
+        x = self.in_proj_states(hidden_states.squeeze(1))  # (B D)
+        z = self.in_proj_gates(hidden_states.squeeze(1))  # (B D)
 
         # Conv step
         x = causal_conv1d_update(
@@ -452,8 +480,9 @@ class W4A16QMamba(nn.Module):
             self.activation,
         )
 
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.x_proj_dt(x)
+        B = self.x_proj_b(x)
+        C = self.x_proj_c(x)
         dt = self.dt_proj(dt) # (B d_inner)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
@@ -543,7 +572,8 @@ class W4A8QMamba(nn.Module):
         self.layer_idx = layer_idx
         assert bias is False, "Only support bias=False for now"
 
-        self.in_proj = W4A8B8O8Linear(self.d_model, self.d_inner * 2, group_size=128)
+        self.in_proj_states = W4A8B8O8Linear(self.d_model, self.d_inner, group_size=128)
+        self.in_proj_gates = W4A8B8O8Linear(self.d_model, self.d_inner, group_size=128)
 
         self.conv1d = QCausalConv1D(
             in_channels=self.d_inner,
@@ -557,9 +587,9 @@ class W4A8QMamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = W4A8B8O8Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, group_size=128
-        )
+        self.x_proj_dt = W4A8B8O8Linear(self.d_inner, self.dt_rank, group_size=128)
+        self.x_proj_b = W4A8B8O8Linear(self.d_inner, self.d_state, group_size=128)
+        self.x_proj_c = W4A8B8O8Linear(self.d_inner, self.d_state, group_size=128)
         # we seperate the bias and put the bias in the QSScan
         self.dt_proj = W8A8B8O8Linear(self.dt_rank, self.d_inner)
 
@@ -589,11 +619,16 @@ class W4A8QMamba(nn.Module):
             dtype=torch.float16,
         )
 
-        # input proj, weight group_size=128
-        qmixer.in_proj = W4A8B8O8Linear.from_fp16(
-            originalLayer=copy.deepcopy(originalLayer.in_proj),
-            input_scale=act_scales["in_proj:input"],
-            output_scale=act_scales["in_proj:output"],
+        # input proj, weight group_size=128 (split into states/gates)
+        qmixer.in_proj_states = W4A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.in_proj_states),
+            input_scale=act_scales["in_proj_states:input"],
+            output_scale=act_scales["in_proj_states:output"],
+        )
+        qmixer.in_proj_gates = W4A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.in_proj_gates),
+            input_scale=act_scales["in_proj_gates:input"],
+            output_scale=act_scales["in_proj_gates:output"],
         )
 
         # causal conv
@@ -602,23 +637,62 @@ class W4A8QMamba(nn.Module):
         assert qmixer.activation == "silu"
         qmixer.conv1d = QCausalConv1D.from_fp16(
             originalLayer=copy.deepcopy(originalLayer.conv1d),
-            input_scale=act_scales["in_proj:output"].item(),
-            output_scale=act_scales["x_proj:input"].item(),            
+            input_scale=act_scales["in_proj_states:output"].item(),
+            output_scale=act_scales["x_proj_dt:input"].item(),
         )
 
-        # x_proj
-        qmixer.x_proj = W4A8B8O8Linear.from_fp16(
-            originalLayer=copy.deepcopy(originalLayer.x_proj),
-            input_scale=act_scales["x_proj:input"],
-            output_scale=act_scales["x_proj:output"],
+        # x_proj (split into separate projs)
+        qmixer.x_proj_b = W4A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.x_proj_b),
+            input_scale=act_scales["x_proj_dt:input"],
+            output_scale=act_scales["x_proj_b:output"],
+        )
+        qmixer.x_proj_c = W4A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.x_proj_c),
+            input_scale=act_scales["x_proj_dt:input"],
+            output_scale=act_scales["x_proj_c:output"],
         )
 
+        # dt_proj
         # We use W8A8B8O8 dt_proj, becuase W4A8B8O8 does not support M=bsize, K=48, N=1536
-        qmixer.dt_proj = W8A8B8O8Linear.from_fp16(
-            originalLayer=copy.deepcopy(originalLayer.dt_proj),
-            input_scale=act_scales["x_proj:output"].item(), # use x_proj_scale to avoid additional quantization operations
-            output_scale=act_scales["dt_proj:output"].item(),
-        )
+        dt_pre_scales = act_scales["dt_proj:input"]
+        original_x_proj_dt = copy.deepcopy(originalLayer.x_proj_dt)
+        original_dt_proj = copy.deepcopy(originalLayer.dt_proj)
+
+        if dt_pre_scales.numel() > 1: # per-channel: SmoothQuant
+            device, dtype = original_dt_proj.weight.device, original_dt_proj.weight.dtype
+            dt_pre_scales.to(device).to(dtype)
+            weight_scales = original_dt_proj.weight.abs().max(dim=0)[0].clamp(min=1e-9)
+            alpha = 0.5
+            smooth_scales = (
+                (dt_pre_scales.pow(alpha) / weight_scales.pow(alpha))
+                .clamp(min=1e-9).to(device).to(dtype)
+            )
+            original_x_proj_dt.weight.div_(smooth_scales.unsqueeze(1))
+            original_dt_proj.weight.mul_(smooth_scales)
+            new_input_scale = (dt_pre_scales / smooth_scales).amax()
+
+            qmixer.x_proj_dt = W4A8B8O8Linear.from_fp16(
+                originalLayer=original_x_proj_dt,
+                input_scale=act_scales["x_proj_dt:input"],
+                output_scale=new_input_scale,
+            )
+            qmixer.dt_proj = W8A8B8O8Linear.from_fp16(
+                originalLayer=original_dt_proj,
+                input_scale=new_input_scale,
+                output_scale=act_scales["dt_proj:output"].item(),
+            )
+        else: # per-tensor: as is
+            qmixer.x_proj_dt = W4A8B8O8Linear.from_fp16(
+                originalLayer=original_x_proj_dt,
+                input_scale=act_scales["x_proj_dt:input"],
+                output_scale=act_scales["x_proj_dt:output"],
+            )
+            qmixer.dt_proj = W8A8B8O8Linear.from_fp16(
+                originalLayer=original_dt_proj,
+                input_scale=act_scales["x_proj_dt:output"].item(), # use x_proj_scale to avoid additional quantization operations
+                output_scale=act_scales["dt_proj:output"].item(),
+            )
 
         # ascan
         qmixer.selective_scan = QSScan.from_fp16(
@@ -626,11 +700,11 @@ class W4A8QMamba(nn.Module):
             originalLayer.A_log.clone(), D=originalLayer.D.clone(),
             dt_bias=originalLayer.dt_proj_bias.clone(), delta_softplus=True,
             ssm_state_scale=act_scales["ssm_state_act:input"],
-            u_scale=act_scales["x_proj:input"],
+            u_scale=act_scales["x_proj_dt:input"],
             dt_scale=act_scales["dt_proj:output"],
-            B_scale=act_scales["x_proj:output"],
-            C_scale=act_scales["x_proj:output"],
-            z_scale=act_scales["in_proj:output"],
+            B_scale=act_scales["x_proj_b:output"],
+            C_scale=act_scales["x_proj_c:output"],
+            z_scale=act_scales["in_proj_gates:output"],
         )
 
         # output proj
@@ -660,9 +734,9 @@ class W4A8QMamba(nn.Module):
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
 
-        xz = self.in_proj.to_seqlen_last(hidden_states) # (B, D, L) 
-        x, z = xz.chunk(2, dim=1) #(B, D, L), #(B, D, L)
-        
+        x = self.in_proj_states.to_seqlen_last(hidden_states) # (B, D, L)
+        z = self.in_proj_gates.to_seqlen_last(hidden_states) # (B, D, L)
+
         # Perform causal conv1d and return conv_state
         if conv_state is not None:
             # store quantized x into conv_state
@@ -673,20 +747,21 @@ class W4A8QMamba(nn.Module):
 
         # Compute dt, B, C
         x_reshape = rearrange(x, "b d l -> b l d").contiguous()
-        x_dbl = self.x_proj(x_reshape)  # (bl d)
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        
+        dt = self.x_proj_dt(x_reshape)
+        B = self.x_proj_b(x_reshape)
+        C = self.x_proj_c(x_reshape)
+
         # Compute dt proj with x_proj_scale
         dt = self.dt_proj.to_seqlen_last(dt.contiguous())
         B = rearrange(B, "b l dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "b l dstate -> b dstate l", l=seqlen).contiguous()
-        
+
         # SSM step and return ssm_state
         y = self.selective_scan.forward(x, dt, B, C, z=z, return_last_state=ssm_state is not None)
         if ssm_state is not None:
             y, last_state = y # y: fp16, last_state: fp32
             ssm_state.copy_(last_state) # last_state: fp32 copy to ssm_state: fp16
-        
+
         # Output projection
         y = self.had(y) # input fp16, output is int8
         out = self.out_proj(y) # HadW8A8BF16OF16Linear: input int8, output is fp16
@@ -697,15 +772,16 @@ class W4A8QMamba(nn.Module):
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 
         # Input projection for x, z
-        xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-        x, z = xz.chunk(2, dim=-1)  # (B D)
+        x = self.in_proj_states(hidden_states.squeeze(1))  # (B D)
+        z = self.in_proj_gates(hidden_states.squeeze(1))  # (B D)
 
         # Perform causal conv1d and update conv_state in-place
         x = self.conv1d.update(x, conv_state)
 
-        # Compute dt, B, C 
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        # Compute dt, B, C
+        dt = self.x_proj_dt(x)
+        B = self.x_proj_b(x)
+        C = self.x_proj_c(x)
         dt = self.dt_proj(dt.contiguous())
 
         # SSM step and update ssm_state in-place
@@ -790,7 +866,8 @@ class W8A8QMamba(nn.Module):
         self.layer_idx = layer_idx
         assert bias is False, "Only support bias=False for now"
 
-        self.in_proj = W8A8B8O8Linear(self.d_model, self.d_inner * 2)
+        self.in_proj_states = W8A8B8O8Linear(self.d_model, self.d_inner)
+        self.in_proj_gates  = W8A8B8O8Linear(self.d_model, self.d_inner)
 
         self.conv1d = QCausalConv1D(
             in_channels=self.d_inner,
@@ -804,7 +881,9 @@ class W8A8QMamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = W8A8B8O8Linear(self.d_inner, self.dt_rank + self.d_state * 2)
+        self.x_proj_dt = W8A8B8O8Linear(self.d_inner, self.dt_rank)
+        self.x_proj_b  = W8A8B8O8Linear(self.d_inner, self.d_state)
+        self.x_proj_c  = W8A8B8O8Linear(self.d_inner, self.d_state)
         # we seperate the bias and put the bias in the QSScan
         self.dt_proj = W8A8B8O8Linear(self.dt_rank, self.d_inner)
 
@@ -835,10 +914,15 @@ class W8A8QMamba(nn.Module):
         )
 
         # input proj
-        qmixer.in_proj = W8A8B8O8Linear.from_fp16(
-            originalLayer=copy.deepcopy(originalLayer.in_proj),
-            input_scale=act_scales["in_proj:input"].item(),
-            output_scale=act_scales["in_proj:output"].item(),
+        qmixer.in_proj_states = W8A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.in_proj_states),
+            input_scale=act_scales["in_proj_states:input"].item(),
+            output_scale=act_scales["in_proj_states:output"].item(),
+        )
+        qmixer.in_proj_gates = W8A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.in_proj_gates),
+            input_scale=act_scales["in_proj_gates:input"].item(),
+            output_scale=act_scales["in_proj_gates:output"].item(),
         )
 
         # causal conv
@@ -847,26 +931,63 @@ class W8A8QMamba(nn.Module):
         assert qmixer.activation == "silu"
         qmixer.conv1d = QCausalConv1D.from_fp16(
             originalLayer=copy.deepcopy(originalLayer.conv1d),
-            input_scale=act_scales["in_proj:output"].item(),
-            output_scale=act_scales["x_proj:input"].item(),            
+            input_scale=act_scales["in_proj_states:output"].item(),
+            output_scale=act_scales["x_proj_dt:input"].item(),
         )
 
         # x_proj
-        qmixer.x_proj = W8A8B8O8Linear.from_fp16(
-            originalLayer=copy.deepcopy(originalLayer.x_proj),
-            input_scale=act_scales["x_proj:input"].item(),
-            output_scale=act_scales["x_proj:output"].item(),
+        qmixer.x_proj_b = W8A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.x_proj_b),
+            input_scale=act_scales["x_proj_dt:input"].item(),
+            output_scale=act_scales["x_proj_b:output"].item(),
+        )
+        qmixer.x_proj_c = W8A8B8O8Linear.from_fp16(
+            originalLayer=copy.deepcopy(originalLayer.x_proj_c),
+            input_scale=act_scales["x_proj_dt:input"].item(),
+            output_scale=act_scales["x_proj_c:output"].item(),
         )
 
         # dt_proj
+        dt_proj_bias = originalLayer.dt_proj_bias.clone() # MambaSimple has separated bias
+
+        dt_pre_scales = act_scales["dt_proj:input"]
+        original_x_proj_dt = copy.deepcopy(originalLayer.x_proj_dt)
         original_dt_proj = copy.deepcopy(originalLayer.dt_proj)
-        dt_proj_bias = originalLayer.dt_proj_bias.clone() # MambaSimple has separated bias 
-        # original_dt_proj.bias = None
-        qmixer.dt_proj = W8A8B8O8Linear.from_fp16(
-            originalLayer=original_dt_proj,
-            input_scale=act_scales["x_proj:output"].item(), # use x_proj_scale to avoid additional quantization operations
-            output_scale=act_scales["dt_proj:output"].item(),
-        )
+
+        if dt_pre_scales.numel() > 1: # per-channel: SmoothQuant
+            device, dtype = original_dt_proj.weight.device, original_dt_proj.weight.dtype
+            dt_pre_scales.to(device).to(dtype)
+            weight_scales = original_dt_proj.weight.abs().max(dim=0)[0].clamp(min=1e-9)
+            alpha = 0.5
+            smooth_scales = (
+                (dt_pre_scales.pow(alpha) / weight_scales.pow(alpha))
+                .clamp(min=1e-9).to(device).to(dtype)
+            )
+            original_x_proj_dt.weight.div_(smooth_scales.unsqueeze(1))
+            original_dt_proj.weight.mul_(smooth_scales)
+            new_input_scale = (dt_pre_scales / smooth_scales).amax()
+
+            qmixer.x_proj_dt = W8A8B8O8Linear.from_fp16(
+                originalLayer=original_x_proj_dt,
+                input_scale=act_scales["x_proj_dt:input"].item(),
+                output_scale=new_input_scale,
+            )
+            qmixer.dt_proj = W8A8B8O8Linear.from_fp16(
+                originalLayer=original_dt_proj,
+                input_scale=new_input_scale,
+                output_scale=act_scales["dt_proj:output"].item(),
+            )
+        else: # per-tensor: as is
+            qmixer.x_proj_dt = W8A8B8O8Linear.from_fp16(
+                originalLayer=original_x_proj_dt,
+                input_scale=act_scales["x_proj_dt:input"].item(),
+                output_scale=act_scales["x_proj_dt:output"].item(),
+            )
+            qmixer.dt_proj = W8A8B8O8Linear.from_fp16(
+                originalLayer=original_dt_proj,
+                input_scale=act_scales["x_proj_dt:output"].item(), # use x_proj_scale to avoid additional quantization operations
+                output_scale=act_scales["dt_proj:output"].item(),
+            )
 
         # ascan
         qmixer.selective_scan = QSScan.from_fp16(
@@ -874,11 +995,11 @@ class W8A8QMamba(nn.Module):
             originalLayer.A_log.clone(), D=originalLayer.D.clone(),
             dt_bias=dt_proj_bias, delta_softplus=True,
             ssm_state_scale=act_scales["ssm_state_act:input"],
-            u_scale=act_scales["x_proj:input"],
+            u_scale=act_scales["x_proj_dt:input"],
             dt_scale=act_scales["dt_proj:output"],
-            B_scale=act_scales["x_proj:output"],
-            C_scale=act_scales["x_proj:output"],
-            z_scale=act_scales["in_proj:output"],
+            B_scale=act_scales["x_proj_b:output"],
+            C_scale=act_scales["x_proj_c:output"],
+            z_scale=act_scales["in_proj_gates:output"],
         )
 
         # output proj
@@ -908,9 +1029,9 @@ class W8A8QMamba(nn.Module):
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
 
-        xz = self.in_proj.to_seqlen_last(hidden_states) #(B, D, L)
-        x, z = xz.chunk(2, dim=1) #(B, D, L), #(B, D, L)
-        
+        x = self.in_proj_states.to_seqlen_last(hidden_states)
+        z = self.in_proj_gates .to_seqlen_last(hidden_states)
+
         # Perform causal conv1d and return conv_state
         if conv_state is not None:
             # store quantized x into conv_state
@@ -921,20 +1042,21 @@ class W8A8QMamba(nn.Module):
 
         # Compute dt, B, C
         x_reshape = rearrange(x, "b d l -> b l d").contiguous()
-        x_dbl = self.x_proj(x_reshape)  # (bl d)
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        
+        dt = self.x_proj_dt(x_reshape)
+        B  = self.x_proj_b(x_reshape)
+        C  = self.x_proj_c(x_reshape)
+
         # Compute dt proj with x_proj_scale
         dt = self.dt_proj.to_seqlen_last(dt.contiguous())
         B = rearrange(B, "b l dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "b l dstate -> b dstate l", l=seqlen).contiguous()
-        
+
         # SSM step and return ssm_state
         y = self.selective_scan.forward(x, dt, B, C, z=z, return_last_state=ssm_state is not None)
         if ssm_state is not None:
             y, last_state = y # y: fp16, last_state: fp32
             ssm_state.copy_(last_state) # last_state: fp32 copy to ssm_state: fp16
-        
+
         # Output projection
         y = self.had(y) # input fp16, output is int8
         out = self.out_proj(y) # HadW8A8BF16OF16Linear: input int8, output is fp16
@@ -945,15 +1067,16 @@ class W8A8QMamba(nn.Module):
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 
         # Input projection for x, z
-        xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-        x, z = xz.chunk(2, dim=-1)  # (B D)
+        x = self.in_proj_states(hidden_states.squeeze(1))
+        z = self.in_proj_gates (hidden_states.squeeze(1))
 
         # Perform causal conv1d and update conv_state in-place
         x = self.conv1d.update(x, conv_state)
 
-        # Compute dt, B, C 
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        # Compute dt, B, C
+        dt = self.x_proj_dt(x)
+        B  = self.x_proj_b(x)
+        C  = self.x_proj_c(x)
         dt = self.dt_proj(dt.contiguous())
 
         # SSM step and update ssm_state in-place

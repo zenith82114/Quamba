@@ -54,6 +54,9 @@ def set_deterministic(seed):
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def get_quantize_options(parser):
     # quantization parameters
@@ -108,7 +111,7 @@ def get_quantize_options(parser):
         '--hybrid_blocks_config', type=str, default=None,
         help='Path to the the configuration for hybrid blocks'
     )
-    
+
 def parse_options():
     parser = argparse.ArgumentParser()
     parser.add_argument(

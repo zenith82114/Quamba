@@ -18,7 +18,7 @@ def _get_minmax_quantization_params(w_max, w_min, n_bits, clip_ratio, sym):
     if sym:
         if clip_ratio < 1.0:
             w_max = w_max * clip_ratio
-        scales = w_max / q_max
+        scales = w_max.clamp(min=1e-9) / q_max
         base = torch.zeros_like(scales)
     else:
         assert w_min is not None, "w_min should not be None for asymmetric quantization."
@@ -27,7 +27,7 @@ def _get_minmax_quantization_params(w_max, w_min, n_bits, clip_ratio, sym):
             w_min = w_min * clip_ratio
         scales = (w_max-w_min).clamp(min=1e-5) / q_max
         base = torch.round(-w_min/scales).clamp_(min=q_min, max=q_max)
-        
+
     return scales.to(torch.float32).clamp(min=1e-6), base.to(torch.float32)
 
 
@@ -44,7 +44,7 @@ class PerTensorMinmaxObserver:
         self.has_statistic = True
         #assert w.dim() == 2, "Observer only support 2d tensor, please handle the shape outside."
         if self.sym:
-            comming_max = w.abs().amax().clamp(min=1e-5)
+            comming_max = w.abs().amax()#.clamp(min=1e-5)
         else:
             comming_max = w.amax()
             comming_min = w.amin()
@@ -53,14 +53,14 @@ class PerTensorMinmaxObserver:
             self.w_max = comming_max
         else:
             self.w_max = torch.max(comming_max, self.w_max)
-        
+
         if not self.sym:
             if self.w_min is None:
                 self.w_min = comming_min
             else:
                 self.w_min = torch.min(comming_min, self.w_min)
-        
-        
+
+
     def get_quantization_parameters(self):
         assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
         return _get_minmax_quantization_params(
@@ -70,7 +70,60 @@ class PerTensorMinmaxObserver:
             clip_ratio=self.clip_ratio,
             sym=self.sym
         )
-        
+
+
+class PerChannelPercentileObserver:
+    def __init__(self, n_bits, clip_ratio, sym,
+                 percentile_sigma=0.01, percentile_alpha=0.99999):
+        self.n_bits = n_bits
+        self.clip_ratio = clip_ratio
+        self.sym = sym
+        self.w_max = None
+        self.w_min = None
+        self.has_statistic = False
+        self.percentile_sigma = percentile_sigma
+        self.percentile_alpha = percentile_alpha
+
+    def update(self, w):
+        self.has_statistic = True
+        if len(w.shape) == 3:
+            assert w.shape[0] == 1
+            w = w.squeeze(0) # (b=1 l d) -> (l d)
+        w32 = w.clone().to(torch.float32) # quantile() input must be float
+        if self.sym:
+            q_max = torch.quantile(w32.abs().reshape(-1), self.percentile_alpha)
+            cur_max = w.abs().clamp(max=q_max).amax(dim=0)
+        else:
+            q_max = torch.quantile(w32.reshape(-1), self.percentile_alpha)
+            q_min = torch.quantile(w32.reshape(-1), 1.0 - self.percentile_alpha)
+            w = w.clamp(min=q_min, max=q_max)
+            cur_max = w.amax(dim=0)
+            cur_min = w.amin(dim=0)
+
+        if self.w_max is None:
+            self.w_max = cur_max
+        elif self.percentile_sigma < 0:
+            self.w_max = torch.max(self.w_max, cur_max)
+        else:
+            self.w_max = self.w_max + self.percentile_sigma * (cur_max - self.w_max)
+
+        if not self.sym:
+            if self.w_min is None:
+                self.w_min = cur_min
+            else:
+                self.w_min = self.w_min + self.percentile_sigma * (cur_min - self.w_min)
+
+    def get_quantization_parameters(self):
+        assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
+
+        return _get_minmax_quantization_params(
+            w_max=self.w_max,
+            w_min=self.w_min,
+            sym=self.sym,
+            n_bits=self.n_bits,
+            clip_ratio=self.clip_ratio
+        )
+
 
 class PerTensorPercentileObserver:
     def __init__(self, n_bits, clip_ratio, sym,
@@ -92,8 +145,7 @@ class PerTensorPercentileObserver:
             cur_max = torch.quantile(w.abs().reshape(-1), self.percentile_alpha)
         else:
             cur_max = torch.quantile(w.reshape(-1), self.percentile_alpha)
-            cur_min = torch.quantile(w.reshape(-1),
-                                        1.0 - self.percentile_alpha)
+            cur_min = torch.quantile(w.reshape(-1), 1.0 - self.percentile_alpha)
 
         if self.w_max is None:
             self.w_max = cur_max
@@ -108,7 +160,7 @@ class PerTensorPercentileObserver:
 
     def get_quantization_parameters(self):
         assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
-        
+
         return _get_minmax_quantization_params(
             w_max=self.w_max,
             w_min=self.w_min,
@@ -116,7 +168,7 @@ class PerTensorPercentileObserver:
             n_bits=self.n_bits,
             clip_ratio=self.clip_ratio
         )
-        
+
 
 class PerSSDGroupObserver:
     def __init__(self, n_bits, clip_ratio, sym, dstate):
@@ -138,7 +190,7 @@ class PerSSDGroupObserver:
         w = rearrange(w.clone(), "b l (g d) -> b l g d", d=self.dstate)
         wt = w.transpose(1, 2) # [b, l, g, d] -> [b, g, l, d]
         b, g, l, d = wt.shape
-        
+
         wt = wt.transpose(0, 1) # [b, g, l, d] -> [g, b, l, d]
         wt_reshape = wt.reshape(g, -1) # [g, b, l, d] -> [g, b*l*d]
         if self.sym:
@@ -151,7 +203,7 @@ class PerSSDGroupObserver:
             self.w_max = coming_max
         else:
             self.w_max = torch.max(coming_max, self.w_max)
-        
+
         if not self.sym:
             if self.w_min is None:
                 self.w_min = coming_min
@@ -178,12 +230,12 @@ class CrossHeadMinmaxObserver:
             f"but got {len(head_groups)} vs. {ngroups}"
         assert len(channel_group) == ngroups, f"Number of head groups must be equal to ngroups, " \
             f"but got {len(channel_group)} vs. {ngroups}"
-        
+
         for i in range(ngroups):
             for j in range(len(head_groups[i])):
                 assert sum(channel_group[i][j]) == headdim, f"The sum of channel_group must be equal to headdim, " \
                     f"but got {sum(channel_group[i][j])} vs. {headdim}"
-        
+
         self.n_bits = n_bits
         self.clip_ratio = clip_ratio
 
@@ -222,13 +274,13 @@ class CrossHeadMinmaxObserver:
                         self.w_max[g][h_gidx][ch_gidx] = coming_max if self.w_max[g][h_gidx][ch_gidx] is None else torch.max(coming_max, self.w_max[g][h_gidx][ch_gidx])
                     else:
                         coming_max = w_group.amax()
-                        coming_min = w_group.amin()  
+                        coming_min = w_group.amin()
                         self.w_max[g][h_gidx][ch_gidx] = coming_max if self.w_max[g][h_gidx][ch_gidx] is None else torch.max(coming_max, self.w_max[g][h_gidx][ch_gidx])
                         self.w_min[g][h_gidx][ch_gidx] = coming_min if self.w_min[g][h_gidx][ch_gidx] is None else torch.min(coming_min, self.w_min[g][h_gidx][ch_gidx])
                     ch_start = ch_start + ch_gsize
                 h_start = h_start + h_gsize
-        
-        
+
+
     def get_quantization_parameters(self):
         assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
         ssd_group_scales = []
@@ -256,7 +308,7 @@ class CrossHeadMinmaxObserver:
                 head_group_base.append((h_gsize, ch_gsize, h_gbase))
             ssd_group_scales.append(head_group_scales)
             ssd_group_base.append(head_group_base)
-        # HY: in order to unify the api (scale, base) = act_scales.get(name), 
+        # HY: in order to unify the api (scale, base) = act_scales.get(name),
         #     I chose to return a tuple with scales and base, where
         #     scales: list = [
         #       # ssd_group 0
@@ -293,12 +345,12 @@ class CachedStatesCrossHeadMinmaxObserver:
             f"but got {len(head_groups)} vs. {ngroups}"
         assert len(channel_group) == ngroups, f"Number of head groups must be equal to ngroups, " \
             f"but got {len(channel_group)} vs. {ngroups}"
-        
+
         for i in range(ngroups):
             for j in range(len(head_groups[i])):
                 assert sum(channel_group[i][j]) == headdim, f"The sum of channel_group must be equal to headdim, " \
                     f"but got {sum(channel_group[i][j])} vs. {headdim}"
-        
+
         self.n_bits = n_bits
         self.clip_ratio = clip_ratio
 
@@ -348,7 +400,7 @@ class CachedStatesCrossHeadMinmaxObserver:
                             self.w_min[g][h_gidx][ch_gidx] = torch.min(coming_min, self.w_min[g][h_gidx][ch_gidx])
                     ch_start = ch_start + ch_gsize
                 h_start = h_start + h_gsize
-        
+
     def get_quantization_parameters(self):
         assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
         ssd_group_scales = []
@@ -377,7 +429,7 @@ class CachedStatesCrossHeadMinmaxObserver:
                 head_group_base.append((h_gsize, ch_gsize, h_gbase))
             ssd_group_scales.append(head_group_scales)
             ssd_group_base.append(head_group_base)
-        # HY: in order to unify the api (scale, base) = act_scales.get(name), 
+        # HY: in order to unify the api (scale, base) = act_scales.get(name),
         #     I chose to return a tuple with scales and base, where
         #     scales: list = [
         #       # ssd_group 0
