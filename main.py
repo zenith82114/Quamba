@@ -78,6 +78,10 @@ def main(args):
         os.makedirs(args.log_dir, exist_ok=True)
         if args.quantize:
             log_name = f"{model_name}" if is_quamba else f"{model_name}_w{args.w_bits}a{args.a_bits}"
+            if args.fake_quant:
+                w_group = "def" if args.w_group_size is None else args.w_group_size
+                log_name += f"_fq_wg{w_group}_ag{args.a_group_size}_{args.a_group_mode}"
+                log_name += "_gptq" if args.apply_gptq else ""
             log_paths = os.path.join(args.log_dir, f"{log_name}.json")
         else:
             log_paths = os.path.join(args.log_dir, f"{model_name}_fp16.json")

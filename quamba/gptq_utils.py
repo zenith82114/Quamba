@@ -139,7 +139,8 @@ class GPTQ:
         Hinv = H
         
         # init Losses and Q
-        assert group_size <= self.in_dim
+        if group_size == -1 or group_size > self.in_dim:
+            group_size = self.in_dim # per output channel
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
         n_groups = math.ceil(self.in_dim / group_size)

@@ -27,6 +27,8 @@ from .qLinearLayer import HadLinear
 from .qConvLayer import QCausalConv1D
 from .qSelectiveScan import QSScan
 from .qHadamard import Hadamard, QHadamard
+from .fake_quant import FakeQuantAct
+from .quant_utils import fake_quant_weight, fake_quant_groupwise
 
 
 class MambaSimple(nn.Module):
@@ -225,6 +227,195 @@ class MambaSimple(nn.Module):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+
+
+class FakeQMamba(MambaSimple):
+    """
+    MambaSimple with simulated (quantize-dequantize) quantization for accuracy studies.
+    The activation taps sit where W8A8QMamba quantizes and are named after the act_scales keys
+    they mirror, so per-tensor static taps reproduce Quamba while group taps refine the granularity.
+    Weights are fake-quantized in place by quantize_weights_() (after Hadamard fusion and GPTQ).
+    """
+    def __init__(
+        self,
+        originalLayer: MambaSimple,
+        n_bits: int = 8,
+        group_size: int = 0,
+        mode: str = "static",
+        percentile_alpha: float = 0.9995,
+    ):
+        nn.Module.__init__(self)
+        # reuse the (possibly Hadamard-wrapped) submodules of MambaSimple
+        for attr in ["d_model", "d_state", "d_conv", "expand", "d_inner", "dt_rank",
+                     "use_fast_path", "layer_idx", "use_had_transform", "activation"]:
+            setattr(self, attr, getattr(originalLayer, attr))
+        self.in_proj = originalLayer.in_proj
+        self.conv1d = originalLayer.conv1d
+        self.act = originalLayer.act
+        self.x_proj = originalLayer.x_proj
+        self.dt_proj = originalLayer.dt_proj
+        self.dt_proj_bias = originalLayer.dt_proj_bias
+        self.A_log = originalLayer.A_log
+        self.D = originalLayer.D
+        self.ssm_state_act = originalLayer.ssm_state_act
+        self.had = originalLayer.had
+        self.out_proj = originalLayer.out_proj
+
+        device = self.out_proj.weight.device
+        D, R, N = self.d_inner, self.dt_rank, self.d_state
+        tap = partial(FakeQuantAct, n_bits=n_bits, group_size=group_size, mode=mode, device=device)
+        self.in_proj_in_act = tap("in_proj:input", self.d_model)
+        # xz: (B, 2D, L) in forward and (B, 2D) in step
+        self.in_proj_out_act = tap("in_proj:output", 2 * D, channel_dim=1, segments=[D, D])
+        # conv output u: x_proj input and selective scan input
+        self.x_proj_in_act = tap("x_proj:input", D, percentile_alpha=percentile_alpha)
+        # x_dbl: dt_proj input, B, and C
+        self.x_proj_out_act = tap("x_proj:output", R + 2 * N, segments=[R, N, N])
+        self.dt_proj_out_act = tap("dt_proj:output", D)
+        self.out_proj_in_act = tap("out_proj:input", D)
+        # ssm_state: (B, D, N), only used with inference_params (generation)
+        self.ssm_state_fq = tap("ssm_state_act:input", D, channel_dim=1, percentile_alpha=percentile_alpha)
+
+    def get_act_scales(self):
+        # per-tensor scales are 0-dim, as produced by run_quamba_calibration
+        return {m.tensor_name: m.scales.squeeze(0) if m.n_groups == 1 else m.scales
+                for m in self.modules() if isinstance(m, FakeQuantAct)}
+
+    @torch.no_grad()
+    def quantize_weights_(self, w_bits=8, w_group_size=0, dt_proj_bits=8, dt_proj_group_size=0, conv_group_size=0):
+        # mirror Quamba: in_proj, x_proj, out_proj at w_bits; conv1d, A_log, D, dt_bias at int8 per-tensor
+        for name in ["in_proj", "x_proj", "out_proj"]:
+            layer = getattr(self, name)
+            if getattr(layer, "apply_gptq", False):
+                continue # already on the GPTQ grid
+            layer.weight.data = fake_quant_weight(layer.weight.data, w_bits, w_group_size)
+        if not getattr(self.dt_proj, "apply_gptq", False):
+            self.dt_proj.weight.data = fake_quant_weight(self.dt_proj.weight.data, dt_proj_bits, dt_proj_group_size)
+        conv_w = self.conv1d.weight.data # (D, 1, W)
+        if conv_group_size == 0:
+            self.conv1d.weight.data = fake_quant_weight(conv_w, 8, 0)
+        else:
+            # groups of channels share one scale over all taps
+            self.conv1d.weight.data = fake_quant_groupwise(
+                conv_w[:, 0, :], 8, conv_group_size, channel_dim=0, per_token=False).unsqueeze(1)
+        if self.conv1d.bias is not None:
+            self.conv1d.bias.data = fake_quant_weight(self.conv1d.bias.data, 8, 0)
+        self.A_log.data = fake_quant_weight(self.A_log.data, 8, 0)
+        self.D.data = fake_quant_weight(self.D.data, 8, 0)
+        self.dt_proj_bias = fake_quant_weight(self.dt_proj_bias, 8, 0)
+
+    def forward(self, hidden_states, inference_params=None):
+        """
+        hidden_states: (B, L, D)
+        Returns: same shape as hidden_states
+        """
+        batch, seqlen, dim = hidden_states.shape
+
+        conv_state, ssm_state = None, None
+        if inference_params is not None:
+            conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
+            if inference_params.seqlen_offset > 0:
+                # The states are updated inplace
+                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
+                return out
+
+        hidden_states = self.in_proj_in_act(hidden_states)
+        xz = self.in_proj(hidden_states) #(B, L, 2*D)
+        xz = rearrange(xz, "b l d -> b d l")
+        xz = self.in_proj_out_act(xz)
+        x, z = xz.chunk(2, dim=1) #(B, D, L), #(B, D, L)
+
+        # Compute short convolution
+        if conv_state is not None:
+            conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+        x = self.conv1d(x)
+        x = self.act(x[...,:seqlen])
+
+        x_reshape = rearrange(x, "b d l -> b l d")
+        x_reshape = self.x_proj_in_act(x_reshape)
+        x = rearrange(x_reshape, "b l d -> b d l") # the scan takes the same quantized u
+        x_dbl = self.x_proj(x_reshape)  # (bl d)
+        x_dbl = self.x_proj_out_act(x_dbl)
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj(dt) # dt_proj input shares the x_proj output scale, as in W8A8QMamba
+        dt = self.dt_proj_out_act(dt)
+
+        dt = rearrange(dt, "b l d -> b d l", l=seqlen)
+        B = rearrange(B, "b l dstate -> b dstate l", l=seqlen).contiguous()
+        C = rearrange(C, "b l dstate -> b dstate l", l=seqlen).contiguous()
+
+        assert self.activation in ["silu", "swish"]
+        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+        y = selective_scan_fn(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                self.D.float(),
+                z=z,
+                delta_bias=self.dt_proj_bias,
+                delta_softplus=True,
+                return_last_state=ssm_state is not None,
+            )
+
+        if ssm_state is not None:
+            y, last_state = y
+            ssm_state.copy_(self.ssm_state_fq(last_state))
+        y = rearrange(y, "b d l -> b l d")
+        y = self.had(y)
+        y = self.out_proj_in_act(y)
+        out = self.out_proj(y)
+        return out
+
+    def step(self, hidden_states, conv_state, ssm_state):
+        dtype = hidden_states.dtype
+        assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+
+        hidden_states = self.in_proj_in_act(hidden_states.squeeze(1))
+        xz = self.in_proj(hidden_states)  # (B 2D)
+        xz = self.in_proj_out_act(xz)
+        x, z = xz.chunk(2, dim=-1)  # (B D)
+
+        # Conv step
+        if causal_conv1d_update is None:
+            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+            conv_state[:, :, -1] = x
+            x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+            if self.conv1d.bias is not None:
+                x = x + self.conv1d.bias
+            x = self.act(x).to(dtype=dtype)
+        else:
+            x = causal_conv1d_update(
+                x,
+                conv_state,
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                self.conv1d.bias,
+                self.activation,
+            )
+        x = self.x_proj_in_act(x)
+
+        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
+        x_db = self.x_proj_out_act(x_db)
+        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj(dt)
+        dt = self.dt_proj_out_act(dt)
+        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+
+        # SSM step
+        dt = F.softplus(dt+self.dt_proj_bias)
+        dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+        dB = torch.einsum("bd,bn->bdn", dt, B)
+        new_state = ssm_state * dA + rearrange(x, "b d -> b d 1") * dB
+        y = torch.einsum("bdn,bn->bd", new_state.to(dtype), C)
+        ssm_state.copy_(self.ssm_state_fq(new_state)) # the cached state is stored quantized
+        y = y + self.D.to(dtype) * x
+        y = y * self.act(z)  # (B D)
+
+        y = self.had(y)
+        y = self.out_proj_in_act(y)
+        out = self.out_proj(y)
+        return out.unsqueeze(1), conv_state, ssm_state
 
 
 class W4A16QMamba(nn.Module):

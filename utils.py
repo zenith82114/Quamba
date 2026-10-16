@@ -100,6 +100,33 @@ def get_quantize_options(parser):
         '--a_bits', type=int, default=8,
         help='The bit-width for activations applied in the real quantization (default: 8)'
     )
+    # fake (simulated) quantization with channel groups, Mamba1 only
+    parser.add_argument(
+        '--fake_quant', action='store_true', default=False,
+        help='Simulate quantization (quantize-dequantize in fp16) instead of using the real quantized kernels. '
+        'Any --w_bits/--a_bits is allowed (--a_bits 16 disables activation quantization). '
+        'The model is not stored to --pretrained_dir. (default: False)'
+    )
+    parser.add_argument(
+        '--w_group_size', type=int, default=None,
+        help='[--fake_quant] Weight group size along the input dim: 0 = per-tensor, -1 = per-output-channel, '
+        '>0 = group size. (default: None, i.e., Quamba: per-tensor for W8, 128 for W4)'
+    )
+    parser.add_argument(
+        '--a_group_size', type=int, default=0,
+        help='[--fake_quant] Activation group size along the channel dim: 0 = per-tensor, -1 = per-channel, '
+        '>0 = group size. (default: 0)'
+    )
+    parser.add_argument(
+        '--a_group_mode', type=str, default='static', choices=['static', 'dynamic'],
+        help='[--fake_quant] static: calibrated scale per group shared by all tokens; '
+        'dynamic: absmax scale per token and per group at runtime. (default: static)'
+    )
+    parser.add_argument(
+        '--fq_conv_group', action='store_true', default=False,
+        help='[--fake_quant] Also group the conv1d weight along channels with --w_group_size '
+        '(default: False, i.e., int8 per-tensor as in Quamba)'
+    )
     parser.add_argument(
         '--hybrid_blocks', action='store_true', default=False,
         help='Whether to create hybrid blocks for configuring act_bits of blocks in a dynamic fashion.'

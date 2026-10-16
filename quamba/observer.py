@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from .quant_utils import _get_quant_range
+from .quant_utils import _get_quant_range, group_absmax
 
 def _get_uniform_quantization_params(w_max, n_bits, clip_ratio):
     _, q_max = _get_quant_range(n_bits=n_bits, sym=True)
@@ -117,6 +117,88 @@ class PerTensorPercentileObserver:
             clip_ratio=self.clip_ratio
         )
         
+
+class PerGroupMinmaxObserver:
+    """
+    Static per-channel-group scales: one absmax per group of channels (see quant_utils.get_group_index),
+    shared by all tokens. Symmetric only.
+    """
+    def __init__(self, n_bits, clip_ratio, group_index, n_groups, channel_dim=-1):
+        self.n_bits = n_bits
+        self.clip_ratio = clip_ratio
+        self.group_index = group_index
+        self.n_groups = n_groups
+        self.channel_dim = channel_dim
+        self.w_max = None
+        self.has_statistic = False
+
+    def update(self, w):
+        self.has_statistic = True
+        comming_max = group_absmax(w, self.group_index, self.n_groups, self.channel_dim).clamp(min=1e-5)
+        if self.w_max is None:
+            self.w_max = comming_max
+        else:
+            self.w_max = torch.max(comming_max, self.w_max)
+
+    def get_quantization_parameters(self):
+        assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
+        return _get_minmax_quantization_params(
+            w_max=self.w_max, w_min=None, n_bits=self.n_bits, clip_ratio=self.clip_ratio, sym=True)
+
+
+def _quantile_rows(t, q):
+    # torch.quantile() rejects inputs with more than 2**24 elements
+    if t.numel() <= 2**24:
+        return torch.quantile(t, q, dim=1)
+    k = max(1, min(t.shape[1], int(round(q * (t.shape[1] - 1))) + 1))
+    return torch.kthvalue(t, k, dim=1).values
+
+
+class PerGroupPercentileObserver:
+    """
+    Per-channel-group counterpart of PerTensorPercentileObserver (symmetric only):
+    the alpha-quantile of |x| within each group, smoothed with an EMA across updates.
+    """
+    def __init__(self, n_bits, clip_ratio, group_index, n_groups, channel_dim=-1,
+                 percentile_sigma=0.01, percentile_alpha=0.99999):
+        self.n_bits = n_bits
+        self.clip_ratio = clip_ratio
+        self.group_index = group_index
+        self.n_groups = n_groups
+        self.channel_dim = channel_dim
+        self.percentile_sigma = percentile_sigma
+        self.percentile_alpha = percentile_alpha
+        self.w_max = None
+        self.has_statistic = False
+        # groups are contiguous; with equal sizes we can compute all quantiles at once
+        group_sizes = torch.bincount(group_index, minlength=n_groups)
+        self.uniform_group_size = int(group_sizes[0]) if bool((group_sizes == group_sizes[0]).all()) else None
+
+    def update(self, w):
+        self.has_statistic = True
+        wt = w.movedim(self.channel_dim, -1).abs().to(torch.float32)
+        wt = wt.reshape(-1, wt.shape[-1]) # [T, C]
+        if self.uniform_group_size is not None:
+            wt = wt.reshape(wt.shape[0], self.n_groups, self.uniform_group_size)
+            wt = wt.permute(1, 0, 2).reshape(self.n_groups, -1) # [n_groups, T*g]
+            cur_max = _quantile_rows(wt, self.percentile_alpha)
+        else:
+            group_index = self.group_index.to(wt.device)
+            cur_max = torch.stack([
+                _quantile_rows(wt[:, group_index == g].reshape(1, -1), self.percentile_alpha)[0]
+                for g in range(self.n_groups)
+            ])
+        cur_max = cur_max.clamp(min=1e-5)
+        if self.w_max is None:
+            self.w_max = cur_max
+        else:
+            self.w_max = self.w_max + self.percentile_sigma * (cur_max - self.w_max)
+
+    def get_quantization_parameters(self):
+        assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
+        return _get_minmax_quantization_params(
+            w_max=self.w_max, w_min=None, n_bits=self.n_bits, clip_ratio=self.clip_ratio, sym=True)
+
 
 class PerSSDGroupObserver:
     def __init__(self, n_bits, clip_ratio, sym, dstate):

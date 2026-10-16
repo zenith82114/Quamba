@@ -27,6 +27,91 @@ def quantize_tensor_per_tensor_absmax(
     return w, scales.float()
 
 
+def get_group_index(n_channels, group_size, segments=None):
+    """
+    Map each channel to its quantization group.
+    group_size: 0 -> per-tensor (one group, segments ignored)
+               -1 -> per-channel (one group per channel)
+               >0 -> contiguous groups of `group_size` channels inside each segment;
+                     the last group of a segment may be shorter, and a group never
+                     crosses a segment boundary (e.g., xz = [D, D], x_dbl = [R, N, N])
+    Returns: (index LongTensor [n_channels], n_groups)
+    """
+    if group_size == 0:
+        return torch.zeros(n_channels, dtype=torch.long), 1
+    if group_size == -1:
+        return torch.arange(n_channels, dtype=torch.long), n_channels
+    assert group_size > 0, f"Invalid group_size {group_size}"
+    segments = [n_channels] if segments is None else list(segments)
+    assert sum(segments) == n_channels, f"segments {segments} do not sum to {n_channels}"
+    index, n_groups = [], 0
+    for seg_len in segments:
+        seg_index = torch.arange(seg_len, dtype=torch.long) // group_size
+        index.append(seg_index + n_groups)
+        n_groups += int(seg_index[-1].item()) + 1
+    return torch.cat(index), n_groups
+
+
+@torch.no_grad()
+def group_absmax(x, group_index, n_groups, channel_dim=-1, per_token=False):
+    """
+    Absmax of x within each channel group.
+    per_token=False: reduce over all non-channel dims -> [n_groups]
+    per_token=True: keep the non-channel dims -> [*x.shape without channel_dim, n_groups]
+    """
+    xt = x.movedim(channel_dim, -1).abs().float()
+    if not per_token:
+        xt = xt.reshape(-1, xt.shape[-1]).amax(dim=0)
+    out = torch.zeros(*xt.shape[:-1], n_groups, dtype=xt.dtype, device=xt.device)
+    index = group_index.to(xt.device).expand_as(xt)
+    return out.scatter_reduce_(-1, index, xt, reduce="amax", include_self=True)
+
+
+@torch.no_grad()
+def fake_quant_with_group_scales(x, scales, group_index, n_bits, channel_dim=-1):
+    """
+    Symmetric quantize-dequantize of x.
+    scales: [n_groups] (shared by all tokens) or [*x.shape without channel_dim, n_groups] (per token)
+    """
+    q_min, q_max = _get_quant_range(n_bits, sym=True)
+    xt = x.movedim(channel_dim, -1)
+    s = scales.to(xt.device).float()[..., group_index.to(xt.device)] # per-channel scales
+    qx = (xt.float() / s).round().clamp(q_min, q_max) * s
+    return qx.to(x.dtype).movedim(-1, channel_dim)
+
+
+@torch.no_grad()
+def fake_quant_groupwise(x, n_bits, group_size, channel_dim=-1, segments=None, per_token=True, clip_ratio=1.0):
+    """
+    Dynamic (absmax) symmetric quantize-dequantize of x with channel groups.
+    For a weight [Dout, Din] with channel_dim=-1 and per_token=True, each output row
+    gets its own scale per group of `group_size` input channels.
+    """
+    group_index, n_groups = get_group_index(x.shape[channel_dim], group_size, segments)
+    _, q_max = _get_quant_range(n_bits, sym=True)
+    amax = group_absmax(x, group_index, n_groups, channel_dim, per_token=per_token)
+    scales = (amax.clamp(min=1e-5) * clip_ratio) / q_max
+    return fake_quant_with_group_scales(x, scales, group_index, n_bits, channel_dim)
+
+
+@torch.no_grad()
+def fake_quant_weight(w, n_bits, group_size):
+    """
+    Round-to-nearest symmetric quantize-dequantize of a weight with groups along the
+    last (input / reduction) dim, which is how GPTQ and Marlin group weights.
+    group_size: 0 -> per-tensor, -1 -> per-output-channel, >0 -> groups of `group_size` inputs per output channel
+    Below 8 bits, use the grid of GPTQ (gptq_utils.quant) and Marlin (marlin_utils.get_w4a8_quantize_weights):
+    scale = absmax * 2 / (2^b - 1) with codes in [-2^(b-1), 2^(b-1) - 1], i.e., all 2^b levels.
+    """
+    if group_size == -1:
+        group_size = w.shape[-1]
+    group_index, n_groups = get_group_index(w.shape[-1], group_size)
+    amax = group_absmax(w, group_index, n_groups, channel_dim=-1, per_token=(group_size != 0))
+    q_max = (2**n_bits - 1) / 2 if n_bits < 8 else 2**(n_bits - 1) - 1
+    scales = amax.clamp(min=1e-5) / q_max
+    return fake_quant_with_group_scales(w, scales, group_index, n_bits, channel_dim=-1)
+
+
 @torch.no_grad()
 def quantize_tensor_head_channel_grouping(w, w_head_group_range, w_dim_group_range, n_bits, scales=None, fake_quant=False, clip_ratio=1.0):
 

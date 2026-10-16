@@ -280,6 +280,7 @@ class QuambaMixerModel(MixerModel, nn.Module):
         residual_in_fp32=False,
         device=None,
         dtype=None,
+        lm_head_cfg=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         # only init nn.Module here, because we don't want to create fp16 modules in MixerModel
@@ -335,7 +336,11 @@ class QuambaMixerModel(MixerModel, nn.Module):
         supported_norms = ["QRMSNorm", "RMSNorm"]
         if block_norm not in supported_norms:
             raise ValueError(f"Invalid block_norm: {block_norm}, only support {supported_norms}")
-        self.norm_f = getattr(quamba, block_norm)(d_model, eps=norm_epsilon,**factory_kwargs)
+        # quantize_fp16_model only quantizes norm_f together with lm_head (--quantize_lm_head),
+        # so a fp16 lm_head comes with a fp16 norm_f
+        lm_head_layer = (lm_head_cfg or {}).get("layer", "Linear")
+        norm_f = "RMSNorm" if lm_head_layer == "Linear" else block_norm
+        self.norm_f = getattr(quamba, norm_f)(d_model, eps=norm_epsilon,**factory_kwargs)
 
 
 class QuambaLMHeadModel(MambaLMHeadModel, nn.Module):
@@ -402,6 +407,7 @@ class QuambaLMHeadModel(MambaLMHeadModel, nn.Module):
                 initializer_cfg=initializer_cfg,
                 fused_add_norm=fused_add_norm,
                 residual_in_fp32=residual_in_fp32,
+                lm_head_cfg=lm_head_cfg,
                 **factory_kwargs,
             )
 
@@ -414,7 +420,8 @@ class QuambaLMHeadModel(MambaLMHeadModel, nn.Module):
             if lm_head_layer not in supported_lm_heads:
                 raise ValueError(f"Invalid lm_head layer: {lm_head_layer}, only support {supported_lm_heads}")
             if lm_head_layer == "Linear":
-                self.lm_head = torch.nn.Linear(d_model, vocab_size)
+                # fp16 and no bias, as MambaLMHeadModel's lm_head (with norm_f fused in configure_model)
+                self.lm_head = torch.nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
             elif lm_head_layer == "W4A16B16O16Linear" or lm_head_layer == "W4A8B16O16Linear" or lm_head_layer == "W8A8B16O16Linear":
                 self.lm_head = getattr(quamba, lm_head_layer)(d_model, vocab_size)
             else:

@@ -1,0 +1,94 @@
+import torch
+import torch.nn as nn
+
+from .quant_utils import _get_quant_range, get_group_index, group_absmax, fake_quant_with_group_scales
+from .observer import PerTensorMinmaxObserver, PerTensorPercentileObserver
+from .observer import PerGroupMinmaxObserver, PerGroupPercentileObserver
+
+
+class FakeQuantAct(nn.Module):
+    """
+    Simulated (quantize-dequantize) symmetric activation quantizer with channel groups.
+
+    group_size: 0 -> per-tensor, -1 -> per-channel, >0 -> contiguous groups of channels
+                (see quant_utils.get_group_index; groups never cross `segments` boundaries)
+    mode: "static"  -> one calibrated scale per group, shared by all tokens
+          "dynamic" -> absmax scale per token and per group, computed at runtime
+    state: "off"     -> identity
+           "observe" -> identity, and feed the observer (static mode) for calibration
+           "quant"   -> quantize-dequantize
+    """
+    def __init__(self, tensor_name, n_channels, n_bits=8, group_size=0, mode="static",
+                 channel_dim=-1, segments=None, percentile_alpha=None, device=None):
+        super().__init__()
+        assert mode in ["static", "dynamic"], f"Unsupported mode {mode}"
+        self.tensor_name = tensor_name
+        self.n_channels = n_channels
+        self.n_bits = n_bits
+        self.group_size = group_size
+        self.mode = mode
+        self.channel_dim = channel_dim
+        self.segments = segments
+        self.percentile_alpha = percentile_alpha
+        group_index, self.n_groups = get_group_index(n_channels, group_size, segments)
+        self.register_buffer("group_index", group_index.to(device), persistent=False)
+        self.register_buffer("scales", torch.ones(self.n_groups, dtype=torch.float32, device=device), persistent=False)
+        self.observer = None
+        self.state = "off"
+
+    def _make_observer(self):
+        if self.group_size == 0:
+            if self.percentile_alpha is not None:
+                return PerTensorPercentileObserver(
+                    n_bits=self.n_bits, clip_ratio=1.0, sym=True, percentile_alpha=self.percentile_alpha)
+            return PerTensorMinmaxObserver(n_bits=self.n_bits, clip_ratio=1.0, sym=True)
+        if self.percentile_alpha is not None:
+            return PerGroupPercentileObserver(
+                n_bits=self.n_bits, clip_ratio=1.0, group_index=self.group_index.cpu(), n_groups=self.n_groups,
+                channel_dim=self.channel_dim, percentile_alpha=self.percentile_alpha)
+        return PerGroupMinmaxObserver(
+            n_bits=self.n_bits, clip_ratio=1.0, group_index=self.group_index, n_groups=self.n_groups,
+            channel_dim=self.channel_dim)
+
+    def observe(self):
+        self.state = "observe"
+        self.observer = self._make_observer() if self.mode == "static" else None
+
+    def finalize(self):
+        """Turn the collected statistics into static scales and switch the quantizer off."""
+        if self.observer is not None:
+            scales, _ = self.observer.get_quantization_parameters()
+            self.scales = scales.reshape(self.n_groups).to(self.scales.device, torch.float32)
+            self.observer = None
+        self.state = "off"
+
+    def forward(self, x):
+        if self.state == "off":
+            return x
+        if self.state == "observe":
+            if self.observer is not None:
+                self.observer.update(x.detach())
+            return x
+        if self.mode == "static":
+            scales = self.scales
+        else:
+            _, q_max = _get_quant_range(self.n_bits, sym=True)
+            amax = group_absmax(x, self.group_index, self.n_groups, self.channel_dim, per_token=True)
+            scales = amax.clamp(min=1e-5) / q_max
+        return fake_quant_with_group_scales(x, scales, self.group_index, self.n_bits, self.channel_dim)
+
+    def extra_repr(self):
+        return (f"{self.tensor_name}, n_bits={self.n_bits}, group_size={self.group_size}, "
+                f"n_groups={self.n_groups}, mode={self.mode}, state={self.state}")
+
+
+def set_fake_quant_state(model, state):
+    """state: "off", "observe", "quant", or "finalize" (compute static scales, then off)"""
+    for m in model.modules():
+        if isinstance(m, FakeQuantAct):
+            if state == "observe":
+                m.observe()
+            elif state == "finalize":
+                m.finalize()
+            else:
+                m.state = state
