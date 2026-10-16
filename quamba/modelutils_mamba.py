@@ -1,6 +1,7 @@
 import os
 import gc
 import copy
+import random
 import logging
 from tqdm import tqdm
 from functools import partial
@@ -28,7 +29,7 @@ from .qHadamard import Hadamard
 from .qBlock import HybridQuambaBlock
 # from .fusedNorm import FusedRMSNorm
 from .qNorm import QRMSNorm
-from .observer import PerTensorMinmaxObserver, PerTensorPercentileObserver
+from .observer import PerTensorMinmaxObserver, PerTensorPercentileObserver, make_per_tensor_observer
 from .observer import PerSSDGroupObserver, CrossHeadMinmaxObserver
 from .observer import CachedStatesCrossHeadMinmaxObserver
 from .gptq_utils import GPTQ
@@ -143,11 +144,41 @@ def run_calibration_forward(model, tokenizer, num_samples=512, seq_len=512,
         # clean up the cache
         del inf_cache
 
+def get_calibration_data(tokenizer, dataset, num_samples, seq_len, seed, device):
+    """
+    (calibration_dataset, preprocess_fn) for run_calibration_forward.
+    pile: (None, None), i.e., Quamba's default: the first num_samples val docs, each truncated to seq_len tokens.
+    hellaswag: MambaQuant's calibration data: num_samples random windows of seq_len tokens from the HellaSwag
+               test contexts joined by "\n\n", drawn by random.Random(seed). These are the same windows as
+               MambaQuant's --calib_seed <seed>.
+    """
+    if dataset == "pile":
+        return None, None
+    if dataset != "hellaswag":
+        raise ValueError(f"Unsupported calibration dataset {dataset}, only 'pile' and 'hellaswag' are supported")
+    logger.info(f"Calibrate with {num_samples} random {seq_len}-token windows of hellaswag (seed {seed})")
+    data = load_dataset("hellaswag", split="test")
+    input_ids = tokenizer("\n\n".join(data["ctx"]), return_tensors="pt").input_ids
+    rng = random.Random(seed)
+    windows = []
+    for _ in range(num_samples):
+        i = rng.randint(0, input_ids.shape[1] - seq_len - 1)
+        windows.append(input_ids[:, i:i + seq_len])
+    return windows, lambda ids: ids.to(device)
+
+
 @torch.no_grad()
 def run_quamba_calibration(
         model, model_type, tokenizer, num_samples=512, seq_len=512,
-        calibration_dataset=None, preprocess_fn=None
+        calibration_dataset=None, preprocess_fn=None,
+        act_observer="quamba", hist_percentile=0.999999
     ):
+    """
+    act_observer="quamba": Quamba's recipe, symmetric running absmax, except an EMA of the per-sample
+                           percentile at the conv output (x_proj input) and the SSM state.
+    act_observer="hist": MambaQuant's pooled-histogram percentile (hist_percentile) for every activation,
+                         symmetric (the int8 kernels have no zero points).
+    """
 
     if model_type == "mamba":
         layers = model.backbone.layers
@@ -167,6 +198,10 @@ def run_quamba_calibration(
         percentile_alpha=0.9995  # for smaller model like 130m, use 0.99999
     else:
         raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba' and 'mamba2'")
+
+    # FIXME(HY): hardcode everything for now
+    make_observer = partial(make_per_tensor_observer, act_observer, n_bits=8, sym=True,
+                            percentile_alpha=percentile_alpha, hist_percentile=hist_percentile)
 
     # register min/max observers, num_layer + lm_head
     observers = [{} for _ in range(len(layers) + 1)]
@@ -189,36 +224,15 @@ def run_quamba_calibration(
         mixer = get_mamba(layers[i])
         for name, m in mixer.named_modules():
             if is_calib_ops(m):
-                # FIXME(HY): hardcode everything for now
-                a_bits = 8
-                a_clip_ratio = 1.0
                 op = name.split(".")[0]
-                if is_x(op) or is_ssm_state(op):
-                    observers[i][op + ":input"] = PerTensorPercentileObserver(
-                        n_bits=a_bits,
-                        clip_ratio=a_clip_ratio,
-                        sym=True,
-                        percentile_alpha=percentile_alpha
-                    )
-                else:
-                    observers[i][op + ":input"] = PerTensorMinmaxObserver(
-                        n_bits=a_bits,
-                        clip_ratio=a_clip_ratio,
-                        sym=True
-                    )
-                observers[i][op + ":output"] = PerTensorMinmaxObserver(
-                    n_bits=a_bits,
-                    clip_ratio=a_clip_ratio,
-                    sym=True
-                )
+                observers[i][op + ":input"] = make_observer(percentile=is_x(op) or is_ssm_state(op))
+                observers[i][op + ":output"] = make_observer()
                 hooks.append(
                     m.register_forward_hook(partial(stat_hook, op=op, block_idx=i))
                 )
     # add observer hook for lm_head
-    observers[-1]["lm_head:input"] = PerTensorMinmaxObserver(
-        n_bits=a_bits, clip_ratio=a_clip_ratio, sym=True)
-    observers[-1]["lm_head:output"] = PerTensorMinmaxObserver(
-        n_bits=a_bits, clip_ratio=a_clip_ratio, sym=True)
+    observers[-1]["lm_head:input"] = make_observer()
+    observers[-1]["lm_head:output"] = make_observer()
     hooks.append(
         model.lm_head.register_forward_hook(partial(stat_hook, op="lm_head", block_idx=-1))
     )
@@ -803,7 +817,8 @@ def fake_quantize_model_mamba(model, model_type, tokenizer, device, args, calibr
     quantize_act = cfg["a_bits"] < 16
 
     model = configure_model(model, model_type, use_had_transform=True)
-    act_cfg = dict(n_bits=cfg["a_bits"], group_size=cfg["a_group_size"], mode=cfg["a_group_mode"])
+    act_cfg = dict(n_bits=cfg["a_bits"], group_size=cfg["a_group_size"], mode=cfg["a_group_mode"],
+                   observer=args.act_observer, sym=not args.asym_act, hist_percentile=args.hist_percentile)
     layers = model.backbone.layers
     for i in range(len(layers)):
         layers[i].mixer = FakeQMamba(layers[i].mixer, **act_cfg)
@@ -814,6 +829,9 @@ def fake_quantize_model_mamba(model, model_type, tokenizer, device, args, calibr
 
     # calibrate static activation scales on fp16 weights, as Quamba does
     if quantize_act and cfg["a_group_mode"] == "static":
+        if calibration_dataset is None:
+            calibration_dataset, calib_preprocess_fn = get_calibration_data(
+                tokenizer, args.calib_dataset, args.calib_data_num, args.calib_seqlen, args.calib_seed, device)
         set_fake_quant_state(model, "observe")
         run_calibration_forward(model, tokenizer, args.calib_data_num, args.calib_seqlen,
                                 calibration_dataset, calib_preprocess_fn)
@@ -844,12 +862,30 @@ def fake_quantize_model_mamba(model, model_type, tokenizer, device, args, calibr
     return model.to(device)
 
 
+def get_calib_suffix(args):
+    """
+    Name suffix for a static activation calibration other than Quamba's (Pile 512 x 512, Quamba's observers,
+    symmetric), e.g. "-hellaswag64x258s1-hist0.999999" for MambaQuant's recipe. Empty for Quamba's.
+    """
+    suffix = ""
+    if (args.calib_dataset, args.calib_data_num, args.calib_seqlen) != ("pile", 512, 512):
+        suffix += f"-{args.calib_dataset}{args.calib_data_num}x{args.calib_seqlen}"
+        if args.calib_dataset == "hellaswag":
+            suffix += f"s{args.calib_seed}"
+    if args.act_observer != "quamba":
+        suffix += f"-{args.act_observer}{args.hist_percentile:g}"
+    if args.asym_act:
+        suffix += "-asym"
+    return suffix
+
+
 def get_quantized_model_name(args):
     """
     Directory name of the quantized model under <pretrained_dir>/ut-enyac/.
     The standard recipes keep the names of the released models, quamba[2]-<size>-w{W}a{A} (or -w4aX-<config>):
-    GPTQ for sub-8-bit weights, quantized embedding and lm_head, and head grouping for Mamba2 with 8-bit
-    activations. Every deviation that changes the stored model adds a suffix, so it never reuses another cache.
+    GPTQ for sub-8-bit weights, quantized embedding and lm_head, head grouping for Mamba2 with 8-bit
+    activations, and Quamba's calibration. Every deviation that changes the stored model adds a suffix,
+    so it never reuses another cache.
     """
     model_name = args.model.lower().split('/')[-1]
     is_mamba2 = model_name.startswith("mamba2")
@@ -872,6 +908,8 @@ def get_quantized_model_name(args):
             model_name += "-nohead"
     if is_mamba2 and (args.hybrid_blocks or args.a_bits == 8) and not args.group_heads:
         model_name += "-nogh"
+    if args.hybrid_blocks or args.a_bits == 8: # only these calibrate activation scales
+        model_name += get_calib_suffix(args)
     return model_name
 
 
@@ -941,8 +979,13 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
     model = configure_model(model, model_type, use_had_transform=True) # W4A16 needs had_transform as well
     logging.info(f"Target bit-width W{args.w_bits}A{args.a_bits}")
     if args.a_bits == 8:
+        if calibration_dataset is None:
+            calibration_dataset, calib_preprocess_fn = get_calibration_data(
+                tokenizer, args.calib_dataset, args.calib_data_num, args.calib_seqlen, args.calib_seed, device)
         # Run calibration to get scale and reorder params
         if args.group_heads:
+            if args.act_observer != "quamba":
+                raise NotImplementedError("--group_heads only supports --act_observer quamba")
             logging.info(f"Reordering weights and activations for head grouping")
             reorder_params = get_reorder_params(model, model_type, tokenizer, num_samples=512, seq_len=512)
             reorder_mamba(model, reorder_params)
@@ -958,7 +1001,9 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
                                                 num_samples=args.calib_data_num,
                                                 seq_len=args.calib_seqlen,
                                                 calibration_dataset=calibration_dataset,
-                                                preprocess_fn=calib_preprocess_fn)
+                                                preprocess_fn=calib_preprocess_fn,
+                                                act_observer=args.act_observer,
+                                                hist_percentile=args.hist_percentile)
     elif args.a_bits == 16:
         # not doing anything for activations
         act_scales = {}

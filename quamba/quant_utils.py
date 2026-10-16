@@ -80,6 +80,14 @@ def fake_quant_with_group_scales(x, scales, group_index, n_bits, channel_dim=-1)
     return qx.to(x.dtype).movedim(-1, channel_dim)
 
 
+def fake_quant_asym(x, scale, base, n_bits):
+    """Asymmetric per-tensor quantize-dequantize of x: codes in [0, 2^n_bits - 1] with zero point `base`."""
+    q_min, q_max = _get_quant_range(n_bits, sym=False)
+    s, z = scale.to(x.device).float(), base.to(x.device).float()
+    qx = ((x.float() / s).round() + z).clamp(q_min, q_max)
+    return ((qx - z) * s).to(x.dtype)
+
+
 @torch.no_grad()
 def fake_quant_groupwise(x, n_bits, group_size, channel_dim=-1, segments=None, per_token=True, clip_ratio=1.0):
     """

@@ -243,6 +243,9 @@ class FakeQMamba(MambaSimple):
         group_size: int = 0,
         mode: str = "static",
         percentile_alpha: float = 0.9995,
+        observer: str = "quamba",
+        sym: bool = True,
+        hist_percentile: float = 0.999999,
     ):
         nn.Module.__init__(self)
         # reuse the (possibly Hadamard-wrapped) submodules of MambaSimple
@@ -263,7 +266,8 @@ class FakeQMamba(MambaSimple):
 
         device = self.out_proj.weight.device
         D, R, N = self.d_inner, self.dt_rank, self.d_state
-        tap = partial(FakeQuantAct, n_bits=n_bits, group_size=group_size, mode=mode, device=device)
+        tap = partial(FakeQuantAct, n_bits=n_bits, group_size=group_size, mode=mode, observer=observer,
+                      sym=sym, hist_percentile=hist_percentile, device=device)
         self.in_proj_in_act = tap("in_proj:input", self.d_model)
         # xz: (B, 2D, L) in forward and (B, 2D) in step
         self.in_proj_out_act = tap("in_proj:output", 2 * D, channel_dim=1, segments=[D, D])

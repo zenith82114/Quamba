@@ -1,27 +1,35 @@
 import torch
 import torch.nn as nn
 
-from .quant_utils import _get_quant_range, get_group_index, group_absmax, fake_quant_with_group_scales
-from .observer import PerTensorMinmaxObserver, PerTensorPercentileObserver
+from .quant_utils import _get_quant_range, get_group_index, group_absmax, fake_quant_with_group_scales, fake_quant_asym
+from .observer import make_per_tensor_observer
 from .observer import PerGroupMinmaxObserver, PerGroupPercentileObserver
 
 
 class FakeQuantAct(nn.Module):
     """
-    Simulated (quantize-dequantize) symmetric activation quantizer with channel groups.
+    Simulated (quantize-dequantize) activation quantizer with channel groups.
 
     group_size: 0 -> per-tensor, -1 -> per-channel, >0 -> contiguous groups of channels
                 (see quant_utils.get_group_index; groups never cross `segments` boundaries)
     mode: "static"  -> one calibrated scale per group, shared by all tokens
           "dynamic" -> absmax scale per token and per group, computed at runtime
+    observer: static calibration recipe (observer.make_per_tensor_observer), "quamba" or "hist";
+              groups only support "quamba"
+    sym: symmetric scales; sym=False (zero points) only supports static per-tensor scales
     state: "off"     -> identity
            "observe" -> identity, and feed the observer (static mode) for calibration
            "quant"   -> quantize-dequantize
     """
     def __init__(self, tensor_name, n_channels, n_bits=8, group_size=0, mode="static",
-                 channel_dim=-1, segments=None, percentile_alpha=None, device=None):
+                 channel_dim=-1, segments=None, percentile_alpha=None, observer="quamba", sym=True,
+                 hist_percentile=0.999999, device=None):
         super().__init__()
         assert mode in ["static", "dynamic"], f"Unsupported mode {mode}"
+        if group_size != 0 and observer != "quamba":
+            raise NotImplementedError(f"The {observer} observer only supports per-tensor activations")
+        if not sym and (group_size != 0 or mode != "static"):
+            raise NotImplementedError("Asymmetric activations only support static per-tensor scales")
         self.tensor_name = tensor_name
         self.n_channels = n_channels
         self.n_bits = n_bits
@@ -30,18 +38,22 @@ class FakeQuantAct(nn.Module):
         self.channel_dim = channel_dim
         self.segments = segments
         self.percentile_alpha = percentile_alpha
+        self.observer_kind = observer
+        self.sym = sym
+        self.hist_percentile = hist_percentile
         group_index, self.n_groups = get_group_index(n_channels, group_size, segments)
         self.register_buffer("group_index", group_index.to(device), persistent=False)
         self.register_buffer("scales", torch.ones(self.n_groups, dtype=torch.float32, device=device), persistent=False)
+        # zero points of asymmetric scales
+        self.register_buffer("bases", torch.zeros(self.n_groups, dtype=torch.float32, device=device), persistent=False)
         self.observer = None
         self.state = "off"
 
     def _make_observer(self):
         if self.group_size == 0:
-            if self.percentile_alpha is not None:
-                return PerTensorPercentileObserver(
-                    n_bits=self.n_bits, clip_ratio=1.0, sym=True, percentile_alpha=self.percentile_alpha)
-            return PerTensorMinmaxObserver(n_bits=self.n_bits, clip_ratio=1.0, sym=True)
+            return make_per_tensor_observer(
+                self.observer_kind, self.n_bits, self.sym, percentile=self.percentile_alpha is not None,
+                percentile_alpha=self.percentile_alpha, hist_percentile=self.hist_percentile)
         if self.percentile_alpha is not None:
             return PerGroupPercentileObserver(
                 n_bits=self.n_bits, clip_ratio=1.0, group_index=self.group_index.cpu(), n_groups=self.n_groups,
@@ -57,8 +69,9 @@ class FakeQuantAct(nn.Module):
     def finalize(self):
         """Turn the collected statistics into static scales and switch the quantizer off."""
         if self.observer is not None:
-            scales, _ = self.observer.get_quantization_parameters()
+            scales, bases = self.observer.get_quantization_parameters()
             self.scales = scales.reshape(self.n_groups).to(self.scales.device, torch.float32)
+            self.bases = bases.reshape(self.n_groups).to(self.bases.device, torch.float32)
             self.observer = None
         self.state = "off"
 
@@ -69,6 +82,8 @@ class FakeQuantAct(nn.Module):
             if self.observer is not None:
                 self.observer.update(x.detach())
             return x
+        if not self.sym:
+            return fake_quant_asym(x, self.scales, self.bases, self.n_bits)
         if self.mode == "static":
             scales = self.scales
         else:
@@ -79,7 +94,8 @@ class FakeQuantAct(nn.Module):
 
     def extra_repr(self):
         return (f"{self.tensor_name}, n_bits={self.n_bits}, group_size={self.group_size}, "
-                f"n_groups={self.n_groups}, mode={self.mode}, state={self.state}")
+                f"n_groups={self.n_groups}, mode={self.mode}, observer={self.observer_kind}, "
+                f"sym={self.sym}, state={self.state}")
 
 
 def set_fake_quant_state(model, state):

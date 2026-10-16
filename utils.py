@@ -69,6 +69,34 @@ def get_quantize_options(parser):
         '--calib_seqlen', type=int, default=512,
         help='Maximum sequence length for calibration data (default: 512)'
     )
+    parser.add_argument(
+        '--calib_dataset', type=str, default='pile', choices=['pile', 'hellaswag'],
+        help='Activation calibration data. pile: the first --calib_data_num val docs of the Pile, truncated '
+        'to --calib_seqlen tokens (Quamba). hellaswag: --calib_data_num random --calib_seqlen-token windows '
+        'of the HellaSwag test contexts (MambaQuant uses 64 x 258). (default: pile)'
+    )
+    parser.add_argument(
+        '--calib_seed', type=int, default=1,
+        help='[--calib_dataset hellaswag] Seed of the window draw. Seed N gives the same windows as '
+        'MambaQuant\'s --calib_seed N. (default: 1)'
+    )
+    parser.add_argument(
+        '--act_observer', type=str, default='quamba', choices=['quamba', 'hist', 'hist_xpct'],
+        help='Static activation observers. quamba: running absmax, with an EMA of the per-sample 0.9995 '
+        'percentile at the conv output and the SSM state. hist: MambaQuant\'s histogram pooled over all '
+        'calibration data, clipped at the --hist_percentile quantile of each side, for every activation. '
+        'hist_xpct: hist in place of the running absmax, but Quamba\'s percentile at the conv output and '
+        'the SSM state. (default: quamba)'
+    )
+    parser.add_argument(
+        '--hist_percentile', type=float, default=0.999999,
+        help='[--act_observer hist] Quantile of each side kept unclipped. (default: 0.999999, as in MambaQuant)'
+    )
+    parser.add_argument(
+        '--asym_act', action='store_true', default=False,
+        help='[--fake_quant, static per-tensor activations] Asymmetric activation scales with zero points, '
+        'as in MambaQuant. The int8 kernels are symmetric only. (default: False)'
+    )
     # load/store model
     parser.add_argument(
         '--pretrained_dir', type=str, default=None,
@@ -181,7 +209,7 @@ def parse_options():
     )
     parser.add_argument(
         '--ppl_dataset', type=str, default='wikitext2',
-        help='Dataset for ppl evaluation'
+        help='Dataset(s) for ppl evaluation, comma-separated, e.g., wikitext2,pile'
     )
     parser.add_argument(
         '--log_dir', type=str,
@@ -189,4 +217,8 @@ def parse_options():
     )
     get_quantize_options(parser)
     args = parser.parse_args()
+    if args.asym_act and not (args.fake_quant and args.a_group_size == 0 and args.a_group_mode == "static"):
+        parser.error("--asym_act needs --fake_quant with static per-tensor activations")
+    if args.act_observer != "quamba" and args.fake_quant and args.a_group_size != 0:
+        parser.error("--act_observer hist only supports per-tensor activations (--a_group_size 0)")
     return args

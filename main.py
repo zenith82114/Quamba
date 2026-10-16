@@ -9,7 +9,7 @@ import sys
 import os
 # import this will use lm_eval logging format (see lm_eval/logger.py and lm_eval/__main__.py)
 from quamba.eval_utils import eval_mamba_few_shot, eval_mamba_generation, evaluate_ppl
-from quamba.modelutils_mamba import quantize_model_mamba
+from quamba.modelutils_mamba import quantize_model_mamba, get_calib_suffix
 
 def main(args):    
     model_name = args.model.lower().split('/')[-1]
@@ -35,9 +35,10 @@ def main(args):
     
     logs = {}
     if args.eval_ppl:
-        logging.info(f"Evaluating ppl result (quantized), dataset: {args.ppl_dataset}")
-        ppl_results = evaluate_ppl(model, tokenizer, model_name, batch_size=args.batch_size, device="cuda", dataset=args.ppl_dataset)
-        logs['ppl'] = ppl_results
+        logs['ppl'] = {}
+        for dataset in args.ppl_dataset.split(","):
+            logging.info(f"Evaluating ppl result (quantized), dataset: {dataset}")
+            logs['ppl'].update(evaluate_ppl(model, tokenizer, model_name, batch_size=args.batch_size, device="cuda", dataset=dataset))
     if args.eval_zero_shot:
         logging.info(f"Evaluating result using lm_eval (quantized), task(s): {args.task_list}")
         lm_eval_results = eval_mamba_few_shot(
@@ -82,6 +83,8 @@ def main(args):
                 w_group = "def" if args.w_group_size is None else args.w_group_size
                 log_name += f"_fq_wg{w_group}_ag{args.a_group_size}_{args.a_group_mode}"
                 log_name += "_gptq" if args.apply_gptq else ""
+            if not is_quamba:
+                log_name += get_calib_suffix(args).replace("-", "_")
             log_paths = os.path.join(args.log_dir, f"{log_name}.json")
         else:
             log_paths = os.path.join(args.log_dir, f"{model_name}_fp16.json")

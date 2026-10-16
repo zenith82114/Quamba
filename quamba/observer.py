@@ -1,3 +1,4 @@
+import math
 import numpy as np
 
 import torch
@@ -117,6 +118,96 @@ class PerTensorPercentileObserver:
             clip_ratio=self.clip_ratio
         )
         
+
+_HIST_EPS = torch.finfo(torch.float32).eps * 10
+
+
+def _hist_percentile_linear(hist, edges, percent):
+    # the value below which `percent` of the histogram mass lies, linearly interpolated inside the bin
+    # (MambaQuant's percentile_linear_onedirection, quantize/observers/_hist_manager.py)
+    cum = hist.cumsum(0)
+    target = percent * cum[-1]
+    idx = int(((cum - target) >= 0).int().argmax())
+    r_csum, l_csum = cum[idx], cum[max(idx - 1, 0)]
+    p = ((r_csum - target) / (r_csum - l_csum + _HIST_EPS)).clip(0, 1)
+    return edges[idx] * p + edges[idx + 1] * (1 - p)
+
+
+class PerTensorHistPercentileObserver:
+    """
+    MambaQuant's static activation observer (its PercentileObserver with --observe percentile), per-tensor.
+    One histogram is pooled over all calibration batches. Its bin width is fixed by the first batch
+    (absmax / (num_bins // 2)), and later batches add bins of the same width if they exceed the range.
+    The clip bounds are the `percentile` quantiles of each side separately: of the bins >= 0 for the
+    max and of the bins <= 0 for the min (both sides count the bin centered at 0).
+    sym=True uses the larger of the two bounds, as MambaQuant's symmetric scales do.
+    The arithmetic is float32 as in MambaQuant, so the bounds match it exactly. This matters: in the sparse
+    tail, consecutive order statistics lie far apart, and the float32 rounding of the target rank decides
+    which one is picked.
+    """
+    def __init__(self, n_bits, clip_ratio, sym, percentile=0.999999, num_bins=2048):
+        self.n_bits = n_bits
+        self.clip_ratio = clip_ratio
+        self.sym = sym
+        self.percentile = percentile
+        self.num_bins = num_bins
+        self.bin_width = None
+        self.hist = None # bins [-k, ..., k] * bin_width, each one bin_width wide
+        self.has_statistic = False
+
+    def update(self, w):
+        self.has_statistic = True
+        w = w.detach().reshape(-1)
+        if self.bin_width is None:
+            # in the activation dtype, as in MambaQuant
+            self.bin_width = (w.abs().amax() / (self.num_bins // 2)).clamp(min=_HIST_EPS).float()
+            self.hist = torch.zeros(1, device=w.device)
+        x = w.float() / self.bin_width
+        n_old = self.hist.numel()
+        edge_bound = math.ceil(max(x.abs().amax().item(), n_old / 2) + 0.5) - 0.5
+        n_bins = round(edge_bound * 2)
+        hist = torch.histc(x, bins=n_bins, min=-edge_bound, max=edge_bound)
+        start = (n_bins - n_old) // 2
+        hist[start:start + n_old] += self.hist
+        self.hist = hist
+
+    def get_clip_bounds(self):
+        k = (self.hist.numel() - 1) // 2
+        edges = torch.arange(-k - 0.5, k + 1.0, 1.0, device=self.hist.device) * self.bin_width
+        w_max = _hist_percentile_linear(self.hist[k:], edges[k:], self.percentile)
+        w_min = _hist_percentile_linear(self.hist[:k + 1].flip(0), edges[:k + 2].flip(0), self.percentile)
+        return w_min.clamp(max=0), w_max.clamp(min=0)
+
+    def get_quantization_parameters(self):
+        assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
+        w_min, w_max = self.get_clip_bounds()
+        if self.sym:
+            w_max, w_min = torch.max(-w_min, w_max).clamp(min=1e-5), None
+        return _get_minmax_quantization_params(
+            w_max=w_max,
+            w_min=w_min,
+            n_bits=self.n_bits,
+            clip_ratio=self.clip_ratio,
+            sym=self.sym
+        )
+
+
+def make_per_tensor_observer(kind, n_bits, sym, percentile=False, percentile_alpha=0.9995, hist_percentile=0.999999):
+    """
+    Per-tensor static activation observer of a calibration recipe.
+    kind="quamba": running min/max, or with percentile=True an EMA of each batch's percentile_alpha quantile
+                   (Quamba applies it to the conv output, i.e. the x_proj input, and to the SSM state).
+    kind="hist":   MambaQuant's pooled-histogram percentile (hist_percentile), for every activation.
+    kind="hist_xpct": "hist" in place of the running min/max, Quamba's EMA percentile where Quamba uses it.
+    """
+    if kind == "hist" or (kind == "hist_xpct" and not percentile):
+        return PerTensorHistPercentileObserver(n_bits=n_bits, clip_ratio=1.0, sym=sym, percentile=hist_percentile)
+    if kind not in ["quamba", "hist_xpct"]:
+        raise ValueError(f"Unknown activation observer {kind}, only 'quamba', 'hist' and 'hist_xpct' are supported")
+    if percentile:
+        return PerTensorPercentileObserver(n_bits=n_bits, clip_ratio=1.0, sym=sym, percentile_alpha=percentile_alpha)
+    return PerTensorMinmaxObserver(n_bits=n_bits, clip_ratio=1.0, sym=sym)
+
 
 class PerGroupMinmaxObserver:
     """
