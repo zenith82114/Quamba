@@ -828,7 +828,10 @@ def fake_quantize_model_mamba(model, model_type, tokenizer, device, args, calibr
                                      u_observer=getattr(args, "fq_u_observer", None),
                                      u_percentile=getattr(args, "fq_u_percentile", None),
                                      u_fold=not getattr(args, "fq_u_nofold", False),
-                                     u_scan_percentile=getattr(args, "fq_u_scan_percentile", None), **act_cfg)
+                                     u_scan_percentile=getattr(args, "fq_u_scan_percentile", None),
+                                     u_scan_dynamic=getattr(args, "fq_u_scan_dynamic", False),
+                                     u_scan_group_size=getattr(args, "fq_u_scan_group_size", 0),
+                                     u_scan_clip=getattr(args, "fq_u_scan_clip", 1.0), **act_cfg)
     if args.quantize_lm_head:
         # the norm_f output in Quamba, i.e., the lm_head input
         model.lm_head_act = FakeQuantAct("lm_head:input", model.lm_head.in_features, device=device, **act_cfg)

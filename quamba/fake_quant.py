@@ -13,7 +13,8 @@ class FakeQuantAct(nn.Module):
     group_size: 0 -> per-tensor, -1 -> per-channel, >0 -> contiguous groups of channels
                 (see quant_utils.get_group_index; groups never cross `segments` boundaries)
     mode: "static"  -> one calibrated scale per group, shared by all tokens
-          "dynamic" -> absmax scale per token and per group, computed at runtime
+          "dynamic" -> absmax scale per token and per group, computed at runtime, times dyn_clip;
+                       with dyn_cap, never above the static scale that the observer calibrates
     observer: static calibration recipe (observer.make_per_tensor_observer), "quamba" or "hist";
               groups support "quamba", and per-channel also "pooled" (percentile of all calibration tokens)
     sym: symmetric scales; sym=False (zero points) only supports static per-tensor scales
@@ -23,9 +24,11 @@ class FakeQuantAct(nn.Module):
     """
     def __init__(self, tensor_name, n_channels, n_bits=8, group_size=0, mode="static",
                  channel_dim=-1, segments=None, percentile_alpha=None, observer="quamba", sym=True,
-                 hist_percentile=0.999999, device=None):
+                 hist_percentile=0.999999, dyn_clip=1.0, dyn_cap=False, device=None):
         super().__init__()
         assert mode in ["static", "dynamic"], f"Unsupported mode {mode}"
+        assert 0 < dyn_clip <= 1, f"dyn_clip must be in (0, 1], got {dyn_clip}"
+        assert not dyn_cap or mode == "dynamic", "dyn_cap caps dynamic scales"
         if group_size != 0 and observer not in ["quamba", "pooled"]:
             raise NotImplementedError(f"The {observer} observer only supports per-tensor activations")
         if observer == "pooled" and group_size != -1:
@@ -43,6 +46,8 @@ class FakeQuantAct(nn.Module):
         self.observer_kind = observer
         self.sym = sym
         self.hist_percentile = hist_percentile
+        self.dyn_clip = dyn_clip
+        self.dyn_cap = dyn_cap
         group_index, self.n_groups = get_group_index(n_channels, group_size, segments)
         self.register_buffer("group_index", group_index.to(device), persistent=False)
         self.register_buffer("scales", torch.ones(self.n_groups, dtype=torch.float32, device=device), persistent=False)
@@ -69,7 +74,7 @@ class FakeQuantAct(nn.Module):
 
     def observe(self):
         self.state = "observe"
-        self.observer = self._make_observer() if self.mode == "static" else None
+        self.observer = self._make_observer() if self.mode == "static" or self.dyn_cap else None
 
     def finalize(self):
         """Turn the collected statistics into static scales and switch the quantizer off."""
@@ -94,13 +99,16 @@ class FakeQuantAct(nn.Module):
         else:
             _, q_max = _get_quant_range(self.n_bits, sym=True)
             amax = group_absmax(x, self.group_index, self.n_groups, self.channel_dim, per_token=True)
-            scales = amax.clamp(min=1e-5) / q_max
+            scales = (amax * self.dyn_clip).clamp(min=1e-5) / q_max
+            if self.dyn_cap:
+                scales = torch.minimum(scales, self.scales)
         return fake_quant_with_group_scales(x, scales, self.group_index, self.n_bits, self.channel_dim)
 
     def extra_repr(self):
         return (f"{self.tensor_name}, n_bits={self.n_bits}, group_size={self.group_size}, "
                 f"n_groups={self.n_groups}, mode={self.mode}, observer={self.observer_kind}, "
-                f"sym={self.sym}, state={self.state}")
+                f"sym={self.sym}, " + (f"dyn_clip={self.dyn_clip}, dyn_cap={self.dyn_cap}, " if self.mode == "dynamic" else "")
+                + f"state={self.state}")
 
 
 def set_fake_quant_state(model, state):

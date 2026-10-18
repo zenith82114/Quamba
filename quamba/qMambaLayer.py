@@ -241,6 +241,9 @@ class FakeQMamba(MambaSimple):
     (it cannot rescale its input channels); u_fold=False is an upper bound that no kernel can reach.
     u_scan_percentile gives the scan input (and its D skip) its own per-tensor tap, "u_scan:input", calibrated
     with Quamba's percentile observer at that quantile, so u is quantized once per consumer.
+    u_scan_dynamic instead gives that tap a dynamic per-token scale: u_scan_clip times the absmax of each token
+    over each group of u_scan_group_size channels (0: all channels); with u_scan_percentile too, capped by the
+    static scale above (per group).
     """
     # Quantizers that fq_skip can leave in fp16. "<tap>.<part>" names a segment of a fused tensor,
     # or, for the conv output u, one of its two consumers (x_proj and the selective scan with its D skip).
@@ -281,6 +284,9 @@ class FakeQMamba(MambaSimple):
         u_percentile=None,
         u_fold=True,
         u_scan_percentile=None,
+        u_scan_dynamic=False,
+        u_scan_group_size=0,
+        u_scan_clip=1.0,
     ):
         nn.Module.__init__(self)
         self.check_fq_skip(fq_skip)
@@ -321,7 +327,11 @@ class FakeQMamba(MambaSimple):
                 u_cfg["hist_percentile"] = u_percentile
         self.u_fold = u_fold
         self.u_scan_act = None
-        if u_scan_percentile is not None:
+        if u_scan_dynamic:
+            self.u_scan_act = tap("u_scan:input", D, mode="dynamic", observer="quamba", group_size=u_scan_group_size,
+                                  dyn_clip=u_scan_clip, dyn_cap=u_scan_percentile is not None,
+                                  percentile_alpha=u_scan_percentile)
+        elif u_scan_percentile is not None:
             self.u_scan_act = tap("u_scan:input", D, observer="quamba", group_size=0, percentile_alpha=u_scan_percentile)
         self.x_proj_in_act = tap("x_proj:input", D, **u_cfg)
         # x_dbl: dt_proj input, B, and C

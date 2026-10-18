@@ -185,6 +185,21 @@ def get_quantize_options(parser):
         'scale. (default: shared)'
     )
     parser.add_argument(
+        '--fq_u_scan_dynamic', action='store_true', default=False,
+        help='[--fake_quant] Give the scan input u (and its D skip) its own dynamic per-token scale, the absmax '
+        'of each token (times --fq_u_scan_clip) over each group of --fq_u_scan_group_size channels. The conv kernel '
+        'would reduce over channels per token and write the scales next to the int8 u. With --fq_u_scan_percentile, '
+        'the per-token scales are capped by that static scale. (default: static)'
+    )
+    parser.add_argument(
+        '--fq_u_scan_group_size', type=int, default=0,
+        help='[--fq_u_scan_dynamic] Channels per per-token scale: 0 = all of d_inner, >0 = group size. (default: 0)'
+    )
+    parser.add_argument(
+        '--fq_u_scan_clip', type=float, default=1.0,
+        help='[--fq_u_scan_dynamic] Fraction of the per-token absmax mapped to 127. (default: 1.0)'
+    )
+    parser.add_argument(
         '--fq_u_nofold', action='store_true', default=False,
         help='[--fake_quant] With static u groups, do not fold their scales into the x_proj weight. No int8 GEMM '
         'can rescale its input channels, so this is an upper bound only. (default: fold)'
@@ -267,9 +282,11 @@ def parse_options():
     if args.fq_skip and not args.fake_quant:
         parser.error("--fq_skip needs --fake_quant")
     fq_u = [args.fq_u_group_size is not None, args.fq_u_observer is not None, args.fq_u_percentile is not None,
-            args.fq_u_nofold, args.fq_u_scan_percentile is not None]
+            args.fq_u_nofold, args.fq_u_scan_percentile is not None, args.fq_u_scan_dynamic]
     if any(fq_u) and not args.fake_quant:
         parser.error("--fq_u_* need --fake_quant")
     if any(fq_u) and args.asym_act:
         parser.error("--fq_u_* use Quamba's symmetric observers, drop --asym_act")
+    if (args.fq_u_scan_group_size != 0 or args.fq_u_scan_clip != 1.0) and not args.fq_u_scan_dynamic:
+        parser.error("--fq_u_scan_group_size and --fq_u_scan_clip need --fq_u_scan_dynamic")
     return args
