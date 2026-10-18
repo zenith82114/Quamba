@@ -291,6 +291,45 @@ class PerGroupPercentileObserver:
             w_max=self.w_max, w_min=None, n_bits=self.n_bits, clip_ratio=self.clip_ratio, sym=True)
 
 
+class PerChannelPooledPercentileObserver:
+    """
+    Per-channel alpha-quantile of |x| pooled over all calibration tokens (symmetric only). It keeps the top_k
+    largest |x| of each channel, which holds the quantile while (1 - alpha) * n_tokens < top_k - 1, and
+    interpolates linearly between order statistics as torch.quantile does.
+    Unlike PerGroupPercentileObserver's EMA, every calibration batch counts equally.
+    """
+    def __init__(self, n_bits, clip_ratio, channel_dim=-1, percentile_alpha=0.9995, top_k=64):
+        self.n_bits = n_bits
+        self.clip_ratio = clip_ratio
+        self.channel_dim = channel_dim
+        self.percentile_alpha = percentile_alpha
+        self.top_k = top_k
+        self.top = None # [k, C], descending
+        self.n = 0
+        self.has_statistic = False
+
+    def update(self, w):
+        self.has_statistic = True
+        wt = w.movedim(self.channel_dim, -1).abs().to(torch.float32)
+        wt = wt.reshape(-1, wt.shape[-1]) # [T, C]
+        self.n += wt.shape[0]
+        top = wt if self.top is None else torch.cat([self.top, wt], dim=0)
+        self.top = top.topk(min(self.top_k, top.shape[0]), dim=0).values
+
+    def get_quantization_parameters(self):
+        assert self.has_statistic, "Please run the invoke the update() once before getting statistic."
+        pos = self.percentile_alpha * (self.n - 1)
+        lo = math.floor(pos)
+        r = self.n - 1 - lo # rank of the lower order statistic from the top (0 = max)
+        if r >= self.top.shape[0]:
+            raise ValueError(f"top_k={self.top_k} cannot hold the {self.percentile_alpha} quantile of {self.n} tokens")
+        val = self.top[r]
+        if r > 0:
+            val = val + (pos - lo) * (self.top[r - 1] - val)
+        return _get_minmax_quantization_params(
+            w_max=val.clamp(min=1e-5), w_min=None, n_bits=self.n_bits, clip_ratio=self.clip_ratio, sym=True)
+
+
 class PerSSDGroupObserver:
     def __init__(self, n_bits, clip_ratio, sym, dstate):
         self.n_bits = n_bits

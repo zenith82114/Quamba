@@ -64,7 +64,9 @@ def evaluate_ppl(
     model_name,
     batch_size=1,
     device="cuda",
-    dataset = 'wikitext2'
+    dataset = 'wikitext2',
+    limit=-1,
+    fp32_loss=False
 ):
     """
     model: model name
@@ -78,7 +80,7 @@ def evaluate_ppl(
     testloader = get_eval_loaders(dataset, tokenizer)
    #torch.save(testloader, cache_testloader)
     model.eval()            
-    ppl, _ = my_eval_ppl(model, testloader, bs=batch_size, device=device)
+    ppl, _ = my_eval_ppl(model, testloader, bs=batch_size, device=device, quick_eval_nsamples=limit, fp32_loss=fp32_loss)
     logger.info(f"pereplexity on {dataset}: {ppl.item()}")
     results[dataset] = ppl.item()
     return results
@@ -86,7 +88,7 @@ def evaluate_ppl(
 
 # Function to evaluate perplexity (ppl)
 @torch.no_grad()
-def my_eval_ppl(model, testenc, bs=1, device=None, seq_len=2048, quick_eval_nsamples=-1):
+def my_eval_ppl(model, testenc, bs=1, device=None, seq_len=2048, quick_eval_nsamples=-1, fp32_loss=False):
     model.seqlen = seq_len
     
     # Get input IDs
@@ -118,6 +120,9 @@ def my_eval_ppl(model, testenc, bs=1, device=None, seq_len=2048, quick_eval_nsam
 
         # Forward pass through the model
         lm_logits = model(inputs).logits
+        if fp32_loss:
+            # the fp16 loss resolves PPL only to ~0.1% per batch, too coarse for short probes
+            lm_logits = lm_logits.float()
 
         # Shift logits and labels for next token prediction
         shift_logits = lm_logits[:, :-1, :].contiguous()

@@ -235,7 +235,36 @@ class FakeQMamba(MambaSimple):
     The activation taps sit where W8A8QMamba quantizes and are named after the act_scales keys
     they mirror, so per-tensor static taps reproduce Quamba while group taps refine the granularity.
     Weights are fake-quantized in place by quantize_weights_() (after Hadamard fusion and GPTQ).
+    fq_skip leaves the named quantizers in fp16 (see FQ_SKIP_NAMES); the taps still calibrate.
+    u_group_size / u_observer / u_percentile override the conv output (u) tap. With static channel groups,
+    u_fold folds the group scales into the x_proj weight before it is quantized, as a real int8 GEMM must
+    (it cannot rescale its input channels); u_fold=False is an upper bound that no kernel can reach.
+    u_scan_percentile gives the scan input (and its D skip) its own per-tensor tap, "u_scan:input", calibrated
+    with Quamba's percentile observer at that quantile, so u is quantized once per consumer.
     """
+    # Quantizers that fq_skip can leave in fp16. "<tap>.<part>" names a segment of a fused tensor,
+    # or, for the conv output u, one of its two consumers (x_proj and the selective scan with its D skip).
+    FQ_SKIP_NAMES = [
+        "in_proj:input", "in_proj:output.x", "in_proj:output.z",
+        "x_proj:input.x_proj", "x_proj:input.scan",
+        "x_proj:output.dt", "x_proj:output.B", "x_proj:output.C",
+        "dt_proj:output", "out_proj:input", "ssm_state_act:input",
+        "weight.in_proj", "weight.x_proj", "weight.dt_proj", "weight.out_proj",
+        "weight.conv1d", "weight.conv1d_bias", "weight.A_log", "weight.D", "weight.dt_bias",
+    ]
+
+    @classmethod
+    def check_fq_skip(cls, fq_skip):
+        for s in fq_skip:
+            if not any(cls._skip_matches(name, s) for name in cls.FQ_SKIP_NAMES):
+                raise ValueError(f"--fq_skip {s} matches no quantizer, see FakeQMamba.FQ_SKIP_NAMES")
+
+    @staticmethod
+    def _skip_matches(name, s):
+        if s == "act":
+            return not name.startswith("weight.")
+        return name == s or name.startswith(s + ".")
+
     def __init__(
         self,
         originalLayer: MambaSimple,
@@ -246,8 +275,16 @@ class FakeQMamba(MambaSimple):
         observer: str = "quamba",
         sym: bool = True,
         hist_percentile: float = 0.999999,
+        fq_skip=(),
+        u_group_size=None,
+        u_observer=None,
+        u_percentile=None,
+        u_fold=True,
+        u_scan_percentile=None,
     ):
         nn.Module.__init__(self)
+        self.check_fq_skip(fq_skip)
+        self.fq_skip = list(fq_skip)
         # reuse the (possibly Hadamard-wrapped) submodules of MambaSimple
         for attr in ["d_model", "d_state", "d_conv", "expand", "d_inner", "dt_rank",
                      "use_fast_path", "layer_idx", "use_had_transform", "activation"]:
@@ -272,13 +309,52 @@ class FakeQMamba(MambaSimple):
         # xz: (B, 2D, L) in forward and (B, 2D) in step
         self.in_proj_out_act = tap("in_proj:output", 2 * D, channel_dim=1, segments=[D, D])
         # conv output u: x_proj input and selective scan input
-        self.x_proj_in_act = tap("x_proj:input", D, percentile_alpha=percentile_alpha)
+        u_cfg = dict(percentile_alpha=percentile_alpha)
+        if u_group_size is not None or u_observer is not None or u_percentile is not None:
+            # Quamba's observers: a running absmax, or an EMA of each batch's u_percentile quantile of |x|;
+            # or per channel, the u_percentile quantile of all calibration tokens ("pooled")
+            # or MambaQuant's pooled histogram ("hist", per-tensor, clipped at u_percentile or hist_percentile)
+            u_cfg = dict(observer=u_observer if u_observer in ["pooled", "hist"] else "quamba",
+                         group_size=group_size if u_group_size is None else u_group_size,
+                         percentile_alpha=None if u_observer in ["minmax", "hist"] else (u_percentile or percentile_alpha))
+            if u_observer == "hist" and u_percentile is not None:
+                u_cfg["hist_percentile"] = u_percentile
+        self.u_fold = u_fold
+        self.u_scan_act = None
+        if u_scan_percentile is not None:
+            self.u_scan_act = tap("u_scan:input", D, observer="quamba", group_size=0, percentile_alpha=u_scan_percentile)
+        self.x_proj_in_act = tap("x_proj:input", D, **u_cfg)
         # x_dbl: dt_proj input, B, and C
         self.x_proj_out_act = tap("x_proj:output", R + 2 * N, segments=[R, N, N])
         self.dt_proj_out_act = tap("dt_proj:output", D)
         self.out_proj_in_act = tap("out_proj:input", D)
         # ssm_state: (B, D, N), only used with inference_params (generation)
         self.ssm_state_fq = tap("ssm_state_act:input", D, channel_dim=1, percentile_alpha=percentile_alpha)
+
+    def _skipped(self, name):
+        return any(self._skip_matches(name, s) for s in self.fq_skip)
+
+    def _fq(self, tap, x, parts=None, dim=-1):
+        """
+        Fake-quantize x with tap, leaving the parts named in fq_skip in fp16.
+        parts: [(name, size)] of the segments of x along dim, e.g. [("x", D), ("z", D)]
+        """
+        q = tap(x)
+        if parts is None:
+            return x if self._skipped(tap.tensor_name) else q
+        names = [f"{tap.tensor_name}.{p}" for p, _ in parts]
+        if not any(self._skipped(n) for n in names):
+            return q
+        sizes = [s for _, s in parts]
+        return torch.cat([xf if self._skipped(n) else xq
+                          for n, xf, xq in zip(names, x.split(sizes, dim), q.split(sizes, dim))], dim=dim)
+
+    def _fq_u(self, u):
+        """The conv output u is quantized once; returns (x_proj input, scan input)."""
+        q = self.x_proj_in_act(u)
+        q_scan = q if self.u_scan_act is None else self.u_scan_act(u)
+        return (u if self._skipped("x_proj:input.x_proj") else q,
+                u if self._skipped("x_proj:input.scan") else q_scan)
 
     def get_act_scales(self):
         # per-tensor scales are 0-dim, as produced by run_quamba_calibration
@@ -290,23 +366,36 @@ class FakeQMamba(MambaSimple):
         # mirror Quamba: in_proj, x_proj, out_proj at w_bits; conv1d, A_log, D, dt_bias at int8 per-tensor
         for name in ["in_proj", "x_proj", "out_proj"]:
             layer = getattr(self, name)
-            if getattr(layer, "apply_gptq", False):
-                continue # already on the GPTQ grid
+            if getattr(layer, "apply_gptq", False) or self._skipped(f"weight.{name}"):
+                continue # already on the GPTQ grid, or left in fp16
+            u = self.x_proj_in_act
+            if (name == "x_proj" and self.u_fold and u.group_size != 0 and u.mode == "static"
+                    and not self._skipped("x_proj:input.x_proj")):
+                # the GEMM sees the int8 codes of u: fold the per-channel scales into its input columns
+                s = u.scales[u.group_index].to(layer.weight.device, torch.float32)
+                w_q = fake_quant_weight(layer.weight.data.float() * s, w_bits, w_group_size)
+                layer.weight.data = (w_q.float() / s).to(layer.weight.dtype)
+                continue
             layer.weight.data = fake_quant_weight(layer.weight.data, w_bits, w_group_size)
-        if not getattr(self.dt_proj, "apply_gptq", False):
+        if not getattr(self.dt_proj, "apply_gptq", False) and not self._skipped("weight.dt_proj"):
             self.dt_proj.weight.data = fake_quant_weight(self.dt_proj.weight.data, dt_proj_bits, dt_proj_group_size)
         conv_w = self.conv1d.weight.data # (D, 1, W)
-        if conv_group_size == 0:
+        if self._skipped("weight.conv1d"):
+            pass
+        elif conv_group_size == 0:
             self.conv1d.weight.data = fake_quant_weight(conv_w, 8, 0)
         else:
             # groups of channels share one scale over all taps
             self.conv1d.weight.data = fake_quant_groupwise(
                 conv_w[:, 0, :], 8, conv_group_size, channel_dim=0, per_token=False).unsqueeze(1)
-        if self.conv1d.bias is not None:
+        if self.conv1d.bias is not None and not self._skipped("weight.conv1d_bias"):
             self.conv1d.bias.data = fake_quant_weight(self.conv1d.bias.data, 8, 0)
-        self.A_log.data = fake_quant_weight(self.A_log.data, 8, 0)
-        self.D.data = fake_quant_weight(self.D.data, 8, 0)
-        self.dt_proj_bias = fake_quant_weight(self.dt_proj_bias, 8, 0)
+        if not self._skipped("weight.A_log"):
+            self.A_log.data = fake_quant_weight(self.A_log.data, 8, 0)
+        if not self._skipped("weight.D"):
+            self.D.data = fake_quant_weight(self.D.data, 8, 0)
+        if not self._skipped("weight.dt_bias"):
+            self.dt_proj_bias = fake_quant_weight(self.dt_proj_bias, 8, 0)
 
     def forward(self, hidden_states, inference_params=None):
         """
@@ -323,10 +412,11 @@ class FakeQMamba(MambaSimple):
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
 
-        hidden_states = self.in_proj_in_act(hidden_states)
+        D, R, N = self.d_inner, self.dt_rank, self.d_state
+        hidden_states = self._fq(self.in_proj_in_act, hidden_states)
         xz = self.in_proj(hidden_states) #(B, L, 2*D)
         xz = rearrange(xz, "b l d -> b d l")
-        xz = self.in_proj_out_act(xz)
+        xz = self._fq(self.in_proj_out_act, xz, [("x", D), ("z", D)], dim=1)
         x, z = xz.chunk(2, dim=1) #(B, D, L), #(B, D, L)
 
         # Compute short convolution
@@ -336,13 +426,13 @@ class FakeQMamba(MambaSimple):
         x = self.act(x[...,:seqlen])
 
         x_reshape = rearrange(x, "b d l -> b l d")
-        x_reshape = self.x_proj_in_act(x_reshape)
-        x = rearrange(x_reshape, "b l d -> b d l") # the scan takes the same quantized u
+        x_reshape, u = self._fq_u(x_reshape)
+        x = rearrange(u, "b l d -> b d l") # the scan takes the same quantized u
         x_dbl = self.x_proj(x_reshape)  # (bl d)
-        x_dbl = self.x_proj_out_act(x_dbl)
+        x_dbl = self._fq(self.x_proj_out_act, x_dbl, [("dt", R), ("B", N), ("C", N)])
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj(dt) # dt_proj input shares the x_proj output scale, as in W8A8QMamba
-        dt = self.dt_proj_out_act(dt)
+        dt = self._fq(self.dt_proj_out_act, dt)
 
         dt = rearrange(dt, "b l d -> b d l", l=seqlen)
         B = rearrange(B, "b l dstate -> b dstate l", l=seqlen).contiguous()
@@ -365,10 +455,10 @@ class FakeQMamba(MambaSimple):
 
         if ssm_state is not None:
             y, last_state = y
-            ssm_state.copy_(self.ssm_state_fq(last_state))
+            ssm_state.copy_(self._fq(self.ssm_state_fq, last_state))
         y = rearrange(y, "b d l -> b l d")
         y = self.had(y)
-        y = self.out_proj_in_act(y)
+        y = self._fq(self.out_proj_in_act, y)
         out = self.out_proj(y)
         return out
 
@@ -376,9 +466,10 @@ class FakeQMamba(MambaSimple):
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 
-        hidden_states = self.in_proj_in_act(hidden_states.squeeze(1))
+        D, R, N = self.d_inner, self.dt_rank, self.d_state
+        hidden_states = self._fq(self.in_proj_in_act, hidden_states.squeeze(1))
         xz = self.in_proj(hidden_states)  # (B 2D)
-        xz = self.in_proj_out_act(xz)
+        xz = self._fq(self.in_proj_out_act, xz, [("x", D), ("z", D)], dim=-1)
         x, z = xz.chunk(2, dim=-1)  # (B D)
 
         # Conv step
@@ -397,13 +488,13 @@ class FakeQMamba(MambaSimple):
                 self.conv1d.bias,
                 self.activation,
             )
-        x = self.x_proj_in_act(x)
+        x_in, x = self._fq_u(x)
 
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-        x_db = self.x_proj_out_act(x_db)
+        x_db = self.x_proj(x_in)  # (B dt_rank+2*d_state)
+        x_db = self._fq(self.x_proj_out_act, x_db, [("dt", R), ("B", N), ("C", N)])
         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj(dt)
-        dt = self.dt_proj_out_act(dt)
+        dt = self._fq(self.dt_proj_out_act, dt)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
         # SSM step
@@ -412,12 +503,12 @@ class FakeQMamba(MambaSimple):
         dB = torch.einsum("bd,bn->bdn", dt, B)
         new_state = ssm_state * dA + rearrange(x, "b d -> b d 1") * dB
         y = torch.einsum("bdn,bn->bd", new_state.to(dtype), C)
-        ssm_state.copy_(self.ssm_state_fq(new_state)) # the cached state is stored quantized
+        ssm_state.copy_(self._fq(self.ssm_state_fq, new_state)) # the cached state is stored quantized
         y = y + self.D.to(dtype) * x
         y = y * self.act(z)  # (B D)
 
         y = self.had(y)
-        y = self.out_proj_in_act(y)
+        y = self._fq(self.out_proj_in_act, y)
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
 

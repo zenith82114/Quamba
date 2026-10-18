@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from .quant_utils import _get_quant_range, get_group_index, group_absmax, fake_quant_with_group_scales, fake_quant_asym
 from .observer import make_per_tensor_observer
-from .observer import PerGroupMinmaxObserver, PerGroupPercentileObserver
+from .observer import PerGroupMinmaxObserver, PerGroupPercentileObserver, PerChannelPooledPercentileObserver
 
 
 class FakeQuantAct(nn.Module):
@@ -15,7 +15,7 @@ class FakeQuantAct(nn.Module):
     mode: "static"  -> one calibrated scale per group, shared by all tokens
           "dynamic" -> absmax scale per token and per group, computed at runtime
     observer: static calibration recipe (observer.make_per_tensor_observer), "quamba" or "hist";
-              groups only support "quamba"
+              groups support "quamba", and per-channel also "pooled" (percentile of all calibration tokens)
     sym: symmetric scales; sym=False (zero points) only supports static per-tensor scales
     state: "off"     -> identity
            "observe" -> identity, and feed the observer (static mode) for calibration
@@ -26,8 +26,10 @@ class FakeQuantAct(nn.Module):
                  hist_percentile=0.999999, device=None):
         super().__init__()
         assert mode in ["static", "dynamic"], f"Unsupported mode {mode}"
-        if group_size != 0 and observer != "quamba":
+        if group_size != 0 and observer not in ["quamba", "pooled"]:
             raise NotImplementedError(f"The {observer} observer only supports per-tensor activations")
+        if observer == "pooled" and group_size != -1:
+            raise NotImplementedError("The pooled observer is per-channel only")
         if not sym and (group_size != 0 or mode != "static"):
             raise NotImplementedError("Asymmetric activations only support static per-tensor scales")
         self.tensor_name = tensor_name
@@ -50,6 +52,9 @@ class FakeQuantAct(nn.Module):
         self.state = "off"
 
     def _make_observer(self):
+        if self.observer_kind == "pooled":
+            return PerChannelPooledPercentileObserver(
+                n_bits=self.n_bits, clip_ratio=1.0, channel_dim=self.channel_dim, percentile_alpha=self.percentile_alpha)
         if self.group_size == 0:
             return make_per_tensor_observer(
                 self.observer_kind, self.n_bits, self.sym, percentile=self.percentile_alpha is not None,

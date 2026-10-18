@@ -156,6 +156,40 @@ def get_quantize_options(parser):
         '(default: False, i.e., int8 per-tensor as in Quamba)'
     )
     parser.add_argument(
+        '--fq_skip', type=lambda s: [item for item in s.split(',') if item], default=[],
+        help='[--fake_quant] Comma-separated quantizers to leave in fp16, for error budgets. A name also skips '
+        'its parts, e.g. in_proj:output skips in_proj:output.x and in_proj:output.z; "act" and "weight" '
+        'skip all activations and all weights. Names: see FakeQMamba.FQ_SKIP_NAMES. Static scales are '
+        'calibrated as usual. (default: none)'
+    )
+    parser.add_argument(
+        '--fq_u_group_size', type=int, default=None,
+        help='[--fake_quant] Activation group size for the conv output u only (x_proj input and scan input): '
+        '0 = per-tensor, -1 = per-channel, >0 = group size. Uses Quamba\'s observers there. (default: --a_group_size)'
+    )
+    parser.add_argument(
+        '--fq_u_observer', type=str, default=None, choices=['percentile', 'minmax', 'pooled', 'hist'],
+        help='[--fake_quant] Static observer for u: an EMA of each batch\'s --fq_u_percentile quantile of |x| '
+        '(Quamba), a running absmax, (per-channel only) the --fq_u_percentile quantile of all calibration '
+        'tokens, or (per-tensor only) MambaQuant\'s pooled histogram clipped at --fq_u_percentile '
+        '(default: --hist_percentile). (default: percentile)'
+    )
+    parser.add_argument(
+        '--fq_u_percentile', type=float, default=None,
+        help='[--fake_quant] Quantile kept unclipped at u by the percentile observer. (default: 0.9995, Quamba)'
+    )
+    parser.add_argument(
+        '--fq_u_scan_percentile', type=float, default=None,
+        help='[--fake_quant] Give the scan input u (and its D skip) its own per-tensor scale, Quamba\'s EMA of '
+        'this quantile of |x|, instead of sharing the x_proj input scale. A kernel would write u twice, once per '
+        'scale. (default: shared)'
+    )
+    parser.add_argument(
+        '--fq_u_nofold', action='store_true', default=False,
+        help='[--fake_quant] With static u groups, do not fold their scales into the x_proj weight. No int8 GEMM '
+        'can rescale its input channels, so this is an upper bound only. (default: fold)'
+    )
+    parser.add_argument(
         '--hybrid_blocks', action='store_true', default=False,
         help='Whether to create hybrid blocks for configuring act_bits of blocks in a dynamic fashion.'
     )
@@ -212,6 +246,15 @@ def parse_options():
         help='Dataset(s) for ppl evaluation, comma-separated, e.g., wikitext2,pile'
     )
     parser.add_argument(
+        '--ppl_limit', type=int, default=-1,
+        help='Evaluate ppl on the first N 2048-token windows only, for quick probes (default: -1, all)'
+    )
+    parser.add_argument(
+        '--ppl_fp32_loss', action='store_true', default=False,
+        help='Compute the ppl loss on fp32 logits, as MambaQuant does. Quamba uses fp16 logits, whose loss '
+        'resolves ppl only to ~0.1%% per batch (default: False)'
+    )
+    parser.add_argument(
         '--log_dir', type=str,
         help='path to the json log file storing the result of lm_evan and quantization settingarg'
     )
@@ -221,4 +264,12 @@ def parse_options():
         parser.error("--asym_act needs --fake_quant with static per-tensor activations")
     if args.act_observer != "quamba" and args.fake_quant and args.a_group_size != 0:
         parser.error("--act_observer hist only supports per-tensor activations (--a_group_size 0)")
+    if args.fq_skip and not args.fake_quant:
+        parser.error("--fq_skip needs --fake_quant")
+    fq_u = [args.fq_u_group_size is not None, args.fq_u_observer is not None, args.fq_u_percentile is not None,
+            args.fq_u_nofold, args.fq_u_scan_percentile is not None]
+    if any(fq_u) and not args.fake_quant:
+        parser.error("--fq_u_* need --fake_quant")
+    if any(fq_u) and args.asym_act:
+        parser.error("--fq_u_* use Quamba's symmetric observers, drop --asym_act")
     return args

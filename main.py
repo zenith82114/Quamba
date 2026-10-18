@@ -38,7 +38,8 @@ def main(args):
         logs['ppl'] = {}
         for dataset in args.ppl_dataset.split(","):
             logging.info(f"Evaluating ppl result (quantized), dataset: {dataset}")
-            logs['ppl'].update(evaluate_ppl(model, tokenizer, model_name, batch_size=args.batch_size, device="cuda", dataset=dataset))
+            logs['ppl'].update(evaluate_ppl(model, tokenizer, model_name, batch_size=args.batch_size, device="cuda", dataset=dataset,
+                                         limit=args.ppl_limit, fp32_loss=args.ppl_fp32_loss))
     if args.eval_zero_shot:
         logging.info(f"Evaluating result using lm_eval (quantized), task(s): {args.task_list}")
         lm_eval_results = eval_mamba_few_shot(

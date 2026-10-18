@@ -820,8 +820,15 @@ def fake_quantize_model_mamba(model, model_type, tokenizer, device, args, calibr
     act_cfg = dict(n_bits=cfg["a_bits"], group_size=cfg["a_group_size"], mode=cfg["a_group_mode"],
                    observer=args.act_observer, sym=not args.asym_act, hist_percentile=args.hist_percentile)
     layers = model.backbone.layers
+    fq_skip = getattr(args, "fq_skip", [])
+    if fq_skip:
+        logging.info(f"Fake quantization leaves in fp16: {fq_skip}")
     for i in range(len(layers)):
-        layers[i].mixer = FakeQMamba(layers[i].mixer, **act_cfg)
+        layers[i].mixer = FakeQMamba(layers[i].mixer, fq_skip=fq_skip, u_group_size=getattr(args, "fq_u_group_size", None),
+                                     u_observer=getattr(args, "fq_u_observer", None),
+                                     u_percentile=getattr(args, "fq_u_percentile", None),
+                                     u_fold=not getattr(args, "fq_u_nofold", False),
+                                     u_scan_percentile=getattr(args, "fq_u_scan_percentile", None), **act_cfg)
     if args.quantize_lm_head:
         # the norm_f output in Quamba, i.e., the lm_head input
         model.lm_head_act = FakeQuantAct("lm_head:input", model.lm_head.in_features, device=device, **act_cfg)
