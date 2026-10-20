@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 
 #define FULL_MASK 0xffffffff
 
@@ -150,7 +151,12 @@ inline __device__ void store_output(output_t *out, float out_vals[kNChunks][kNEl
     #pragma unroll
     for (int c = 0; c < kNChunks; ++c) {
         #pragma unroll
-        for (int i = 0; i < kNElts; ++i) { out_vals_store[c][i] = static_cast<output_t>(roundf(out_vals[c][i] * scale)); }
+        for (int i = 0; i < kNElts; ++i) {
+            float v = roundf(out_vals[c][i] * scale);
+            // saturate: a float -> int8 cast of an out-of-range value wraps around (130 -> -126)
+            if constexpr (std::is_same_v<output_t, int8_t>) { v = fminf(fmaxf(v, -128.f), 127.f); }
+            out_vals_store[c][i] = static_cast<output_t>(v);
+        }
     }
     #pragma unroll
     for (int c = 0; c < kNChunks; ++c) {
