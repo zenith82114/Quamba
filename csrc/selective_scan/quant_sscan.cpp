@@ -129,7 +129,8 @@ quant_sscan_fwd(const at::Tensor &u, const at::Tensor &scale_u,
                 const c10::optional<at::Tensor> &D_, const c10::optional<at::Tensor> &scale_D_,
                 const c10::optional<at::Tensor> &z_, const c10::optional<at::Tensor> &scale_z_,
                 const c10::optional<at::Tensor> &delta_bias_, const c10::optional<at::Tensor> &scale_delta_bias_,
-                bool delta_softplus) {
+                bool delta_softplus,
+                const c10::optional<at::Tensor> &scale_u_tok_) {
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Char);
@@ -246,6 +247,20 @@ quant_sscan_fwd(const at::Tensor &u, const at::Tensor &scale_u,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
                        scale_delta_bias_.has_value() ? scale_delta_bias_.value().data_ptr() : nullptr,
                        x.data_ptr(), has_z, delta_softplus);
+    if (scale_u_tok_.has_value()) {
+        // per-token u scales over channel groups, in place of scale_u
+        auto scale_u_tok = scale_u_tok_.value();
+        TORCH_CHECK(scale_u_tok.scalar_type() == at::ScalarType::Float);
+        TORCH_CHECK(scale_u_tok.is_cuda());
+        TORCH_CHECK(scale_u_tok.dim() == 3 && scale_u_tok.size(0) == batch_size && scale_u_tok.size(2) == seqlen,
+                    "scale_u_tok must have shape (batch, dim / group_size, seqlen)");
+        TORCH_CHECK(dim % scale_u_tok.size(1) == 0);
+        TORCH_CHECK(scale_u_tok.stride(-1) == 1);
+        params.scale_u_tok_ptr = scale_u_tok.data_ptr();
+        params.u_tok_batch_stride = scale_u_tok.stride(0);
+        params.u_tok_g_stride = scale_u_tok.stride(1);
+        params.u_tok_group_size = dim / scale_u_tok.size(1);
+    }
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing

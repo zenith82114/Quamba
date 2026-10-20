@@ -83,4 +83,10 @@ struct QuantSSMParams: public SSMParamsBase {
     void *__restrict__ scale_ssm_state_ptr;
     void *__restrict__ scale_delta_ptr;
     void *__restrict__ scale_delta_bias_ptr;
+    // optional per-token u scales over groups of channels: (batch, dim / u_tok_group_size, seqlen) float;
+    // nullptr: the per-tensor scale_u
+    void *__restrict__ scale_u_tok_ptr;
+    index_t u_tok_batch_stride;
+    index_t u_tok_g_stride;
+    int u_tok_group_size;
 };

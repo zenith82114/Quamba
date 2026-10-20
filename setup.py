@@ -247,6 +247,7 @@ ext_modules.append(
             "csrc/causal_conv1d/quant_causal_conv1d.cpp",
             "csrc/causal_conv1d/quant_causal_conv1d_fwd.cu",
             "csrc/causal_conv1d/quant_causal_conv1d_update.cu",
+            "csrc/causal_conv1d/quant_causal_conv1d_dual_fwd.cu",
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],

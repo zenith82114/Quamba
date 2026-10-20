@@ -176,19 +176,19 @@ def get_quantize_options(parser):
     )
     parser.add_argument(
         '--fq_u_percentile', type=float, default=None,
-        help='[--fake_quant] Quantile kept unclipped at u by the percentile observer. (default: 0.9995, Quamba)'
+        help='[--fake_quant or real W8A8] Quantile kept unclipped at u by the percentile observer. (default: 0.9995, Quamba)'
     )
     parser.add_argument(
         '--fq_u_scan_percentile', type=float, default=None,
-        help='[--fake_quant] Give the scan input u (and its D skip) its own per-tensor scale, Quamba\'s EMA of '
+        help='[--fake_quant or real W8A8] Give the scan input u (and its D skip) its own per-tensor scale, Quamba\'s EMA of '
         'this quantile of |x|, instead of sharing the x_proj input scale. A kernel would write u twice, once per '
         'scale. (default: shared)'
     )
     parser.add_argument(
         '--fq_u_scan_dynamic', action='store_true', default=False,
-        help='[--fake_quant] Give the scan input u (and its D skip) its own dynamic per-token scale, the absmax '
-        'of each token (times --fq_u_scan_clip) over each group of --fq_u_scan_group_size channels. The conv kernel '
-        'would reduce over channels per token and write the scales next to the int8 u. With --fq_u_scan_percentile, '
+        help='[--fake_quant or real W8A8 with group size 32/64/128] Give the scan input u (and its D skip) its own dynamic per-token scale, the absmax '
+        'of each token (times --fq_u_scan_clip) over each group of --fq_u_scan_group_size channels. The real conv kernel '
+        '(fwd_dual) reduces over each group per token and writes the scales next to the int8 u. With --fq_u_scan_percentile, '
         'the per-token scales are capped by that static scale. (default: static)'
     )
     parser.add_argument(
@@ -283,8 +283,14 @@ def parse_options():
         parser.error("--fq_skip needs --fake_quant")
     fq_u = [args.fq_u_group_size is not None, args.fq_u_observer is not None, args.fq_u_percentile is not None,
             args.fq_u_nofold, args.fq_u_scan_percentile is not None, args.fq_u_scan_dynamic]
-    if any(fq_u) and not args.fake_quant:
-        parser.error("--fq_u_* need --fake_quant")
+    # the real kernels (W8A8 Mamba1) implement the u percentile, a static scan scale, and dynamic per-token
+    # scan scales over 32, 64 or 128 channels
+    fq_u_fake_only = [args.fq_u_group_size is not None, args.fq_u_observer is not None, args.fq_u_nofold,
+                      args.fq_u_scan_clip != 1.0, args.fq_u_scan_dynamic and args.fq_u_scan_percentile is not None,
+                      args.fq_u_scan_dynamic and args.fq_u_scan_group_size not in [32, 64, 128]]
+    if any(fq_u_fake_only) and not args.fake_quant:
+        parser.error("Without --fake_quant, --fq_u_* only take --fq_u_percentile, --fq_u_scan_percentile, or "
+                     "--fq_u_scan_dynamic with --fq_u_scan_group_size 32, 64 or 128")
     if any(fq_u) and args.asym_act:
         parser.error("--fq_u_* use Quamba's symmetric observers, drop --asym_act")
     if (args.fq_u_scan_group_size != 0 or args.fq_u_scan_clip != 1.0) and not args.fq_u_scan_dynamic:

@@ -54,6 +54,20 @@ struct QuantConvParamsBase: public ConvParamsBase {
     float scale_out;
 };
 
+// quant_causal_conv1d_dual_fwd: a second int8 output for the selective scan, at the static scale
+// scale_out2 (group_size == 0) or at per-token scales over groups of group_size channels
+struct QuantConvDualParams: public QuantConvParamsBase {
+    void *__restrict__ out2_ptr;
+    index_t out2_batch_stride;
+    index_t out2_c_stride;
+    index_t out2_l_stride;
+    float scale_out2;
+    int group_size;
+    void *__restrict__ scales_ptr; // (batch, dim / group_size, seqlen) float
+    index_t scales_batch_stride;
+    index_t scales_g_stride;
+};
+
 struct Quamba2ConvParams: public QuantConvParamsBase {
     // ----- inputs -----
     // define a pointer for xBC to avoid confusion

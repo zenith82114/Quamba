@@ -23,7 +23,7 @@ class QSScanFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, u_scale, delta, delta_scale, A, A_scale, B, B_scale, C, C_scale, ssm_state_scale,
                 D=None, D_scale=None, z=None, z_scale=None, delta_bias=None, delta_bias_scale=None,
-                delta_softplus=False, return_last_state=False):
+                delta_softplus=False, return_last_state=False, u_tok_scales=None):
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -42,7 +42,7 @@ class QSScanFn(torch.autograd.Function):
             C = rearrange(C, "b dstate l -> b 1 dstate l")
         out, x = quant_sscan_cuda.fwd(
             u, u_scale, delta, delta_scale, A, A_scale, B, B_scale, C, C_scale, ssm_state_scale,
-            D, D_scale, z, z_scale, delta_bias, delta_bias_scale, delta_softplus)
+            D, D_scale, z, z_scale, delta_bias, delta_bias_scale, delta_softplus, u_tok_scales)
         # last_state = x[:, :, -1, 1::2]  # (batch, dim, dstate)
         last_state = x[:, :, -1, :]  # (batch, dim, dstate)
         return out if not return_last_state else (out, last_state)
@@ -59,16 +59,18 @@ def quant_selective_scan_fn(
         A, scale_A, B, scale_B, C, scale_C, ssm_state_scale,
         D=None, scale_D=None, z=None, scale_z=None,
         delta_bias=None, scale_delta_bias=None,
-        delta_softplus=False, return_last_state=False):
+        delta_softplus=False, return_last_state=False, u_tok_scales=None):
     """if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
+    u_tok_scales: optional per-token u scales over channel groups, (batch, dim / group_size, seqlen) float,
+    used in place of scale_u.
     """
     return QSScanFn.apply(
         u, scale_u, delta, scale_delta, A, scale_A, 
         B, scale_B, C, scale_C, ssm_state_scale,
         D, scale_D, z, scale_z, delta_bias, scale_delta_bias, 
-        delta_softplus, return_last_state)
+        delta_softplus, return_last_state, u_tok_scales)
 
 
 #W8A8B8O8 QSScan
@@ -138,7 +140,7 @@ class QSScan(nn.Module):
     #NOTE(HY): Only activate q_sscan when quamba is True,
     # since quantize_tensor_per_tensor_absmax only returns real scales when quamba is True.
     @torch.no_grad()
-    def forward(self, u, dt, B, C, z=None, return_last_state=False):
+    def forward(self, u, dt, B, C, z=None, return_last_state=False, u_tok_scales=None):
 
         # q_sscan output int8 y
         y = quant_selective_scan_fn(
@@ -155,6 +157,7 @@ class QSScan(nn.Module):
             scale_delta_bias=self.dt_bias_scale[None] if self.dt_bias is not None else None,
             delta_softplus=self.delta_softplus,
             return_last_state=return_last_state,
+            u_tok_scales=u_tok_scales,
         )
         return y
 

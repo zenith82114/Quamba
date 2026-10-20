@@ -10,7 +10,13 @@ import quamba2_conv1d_cuda
 
 class QCausalConv1D(nn.Module):
 
-    def __init__ (self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, device=None, **kwargs):
+    def __init__ (self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, device=None,
+                  scan_split=False, scan_group_size=0, **kwargs):
+        """
+        scan_split: write the output u twice, once per consumer: at output_scale (the x_proj input) and,
+        for the selective scan, at scan_output_scale, or (scan_group_size > 0) at per-token scales over
+        groups of scan_group_size channels. forward then returns (u_x_proj, u_scan, u_scan_scales or None).
+        """
         factory_kwargs = {"device": device}
         super().__init__()
         assert in_channels == out_channels == groups, "QCausalConv1D only supports in_channels == out_channels == groups"
@@ -36,19 +42,26 @@ class QCausalConv1D(nn.Module):
         self.bias_scale = 0.0
         self.input_scale = 0.0
         self.output_scale = 0.0
+        self.scan_split = scan_split or scan_group_size > 0
+        self.scan_group_size = scan_group_size
+        self.scan_output_scale = 0.0
         self._register_state_dict_hook(self.store_hook)
         self._register_load_state_dict_pre_hook(self.load_hook)
         
     @classmethod
-    def from_fp16(cls, originalLayer: nn.Conv1d, input_scale=1.0, output_scale=1.0):
+    def from_fp16(cls, originalLayer: nn.Conv1d, input_scale=1.0, output_scale=1.0, scan_output_scale=None,
+                  scan_group_size=0):
         device = originalLayer.weight.device
         qconv = cls(originalLayer.in_channels, originalLayer.out_channels,
                     originalLayer.kernel_size, originalLayer.stride,
                     originalLayer.padding, originalLayer.dilation,
-                    originalLayer.groups, originalLayer.bias, device=device)
+                    originalLayer.groups, originalLayer.bias, device=device,
+                    scan_split=scan_output_scale is not None, scan_group_size=scan_group_size)
         
         qconv.input_scale = input_scale
         qconv.output_scale = output_scale
+        if scan_output_scale is not None:
+            qconv.scan_output_scale = scan_output_scale
 
         int8_weight, weight_scale = quantize_tensor_per_tensor_absmax(
             originalLayer.weight.clone().detach(),
@@ -77,6 +90,8 @@ class QCausalConv1D(nn.Module):
         state_dict[prefix + 'bias_scale'] = self.bias_scale
         state_dict[prefix + 'input_scale'] = self.input_scale
         state_dict[prefix + 'output_scale'] = self.output_scale
+        if self.scan_split and self.scan_group_size == 0:
+            state_dict[prefix + 'scan_output_scale'] = self.scan_output_scale
         return state_dict
         
     def load_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -88,9 +103,20 @@ class QCausalConv1D(nn.Module):
         del state_dict[prefix + 'bias_scale']
         del state_dict[prefix + 'input_scale']
         del state_dict[prefix + 'output_scale']
+        if self.scan_split and self.scan_group_size == 0:
+            self.scan_output_scale = state_dict.pop(prefix + 'scan_output_scale')
 
     @torch.no_grad()
     def forward(self, x):
+        if self.scan_split:
+            y, y_scan, scan_scales = quant_causal_conv1d_cuda.fwd_dual(
+                x, self.input_scale,
+                self.weight, self.weight_scale,
+                self.output_scale,
+                self.bias_scale, self.bias,
+                self.scan_output_scale, self.scan_group_size, True
+            )
+            return y, y_scan, scan_scales if self.scan_group_size > 0 else None
         y = quant_causal_conv1d_cuda.fwd(
                 x, self.input_scale,
                 self.weight, self.weight_scale,
@@ -102,6 +128,8 @@ class QCausalConv1D(nn.Module):
 
     @torch.no_grad()
     def update(self, x, conv_state):
+        if self.scan_split:
+            raise NotImplementedError("QCausalConv1D with scan_split has no decoding step yet")
         # update conv_state in-place
         y = quant_causal_conv1d_cuda.update(
             x, conv_state, self.input_scale,

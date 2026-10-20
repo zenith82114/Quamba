@@ -149,12 +149,26 @@ void quant_sscan_fwd_kernel(QuantSSMParams params) {
         u += kChunkSize;
         delta += kChunkSize;
 
+        // per-token u scales: each thread holds kNItems consecutive tokens (blocked arrangement)
+        float scale_u_vals[kNItems];
+        #pragma unroll
+        for (int i = 0; i < kNItems; ++i) { scale_u_vals[i] = scale_u; }
+        if (params.scale_u_tok_ptr != nullptr) {
+            const float *u_tok_scale = reinterpret_cast<float *>(params.scale_u_tok_ptr)
+                + batch_id * params.u_tok_batch_stride + (dim_id * kNRows / params.u_tok_group_size) * params.u_tok_g_stride
+                + chunk * kChunkSize + threadIdx.x * kNItems;
+            #pragma unroll
+            for (int i = 0; i < kNItems; ++i) {
+                scale_u_vals[i] = chunk * kChunkSize + threadIdx.x * kNItems + i < params.seqlen ? u_tok_scale[i] : 0.f;
+            }
+        }
+
         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
             #pragma unroll
             for (int i = 0; i < kNItems; ++i) {
-                float u_val = scale_u * static_cast<float>(u_vals_load[r][i]); //  TODO (HY) need to dequant u_val
+                float u_val = scale_u_vals[i] * static_cast<float>(u_vals_load[r][i]); //  TODO (HY) need to dequant u_val
                 delta_vals[r][i] = scale_delta * static_cast<float>(delta_vals_load[r][i]) + delta_bias[r]; //  TODO (HY) need to dequant delta_vals_load
                 if (params.delta_softplus) {
                     delta_vals[r][i] = delta_vals[r][i] <= 20.f ? log1pf(expf(delta_vals[r][i])) : delta_vals[r][i];

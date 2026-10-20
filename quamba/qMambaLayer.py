@@ -1073,7 +1073,14 @@ class W8A8QMamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
+        u_scan_split=False,
+        u_scan_group_size=0,
     ):
+        """
+        u_scan_split: the conv output u is quantized once per consumer, at the x_proj input scale for x_proj
+        and at the "u_scan:input" scale for the selective scan (and its D skip); u_scan_group_size > 0
+        replaces the latter with dynamic per-token scales over groups of u_scan_group_size channels.
+        """
         factory_kwargs = {"device": device, "dtype": torch.float16}
         super().__init__()
         self.d_model = d_model
@@ -1084,6 +1091,8 @@ class W8A8QMamba(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
+        self.u_scan_split = u_scan_split or u_scan_group_size > 0
+        self.u_scan_group_size = u_scan_group_size
         assert bias is False, "Only support bias=False for now"
 
         self.in_proj = W8A8B8O8Linear(self.d_model, self.d_inner * 2)
@@ -1095,6 +1104,8 @@ class W8A8QMamba(nn.Module):
             kernel_size=d_conv,
             groups=self.d_inner,
             padding=d_conv - 1,
+            scan_split=self.u_scan_split,
+            scan_group_size=u_scan_group_size,
         )
 
         self.activation = "silu"
@@ -1115,8 +1126,13 @@ class W8A8QMamba(nn.Module):
         self.out_proj = W8A8B16O16Linear(self.d_inner, self.d_model)
 
     @classmethod
-    def from_fp16(cls, originalLayer: MambaSimple, act_scales: Dict, use_had_transform: bool = True):
-
+    def from_fp16(cls, originalLayer: MambaSimple, act_scales: Dict, use_had_transform: bool = True,
+                  u_scan_group_size: int = 0):
+        """
+        With a "u_scan:input" scale in act_scales, the selective scan gets its own static u scale;
+        with u_scan_group_size > 0, dynamic per-token u scales over channel groups instead.
+        """
+        u_scan_static = "u_scan:input" in act_scales and u_scan_group_size == 0
         qmixer = cls(
             d_model=originalLayer.d_model,
             d_state=originalLayer.d_state,
@@ -1128,6 +1144,8 @@ class W8A8QMamba(nn.Module):
             layer_idx=originalLayer.layer_idx,
             device=torch.device("cuda"),
             dtype=torch.float16,
+            u_scan_split=u_scan_static,
+            u_scan_group_size=u_scan_group_size,
         )
 
         # input proj
@@ -1144,7 +1162,9 @@ class W8A8QMamba(nn.Module):
         qmixer.conv1d = QCausalConv1D.from_fp16(
             originalLayer=copy.deepcopy(originalLayer.conv1d),
             input_scale=act_scales["in_proj:output"].item(),
-            output_scale=act_scales["x_proj:input"].item(),            
+            output_scale=act_scales["x_proj:input"].item(),
+            scan_output_scale=act_scales["u_scan:input"].item() if u_scan_static else None,
+            scan_group_size=u_scan_group_size,
         )
 
         # x_proj
@@ -1170,7 +1190,8 @@ class W8A8QMamba(nn.Module):
             originalLayer.A_log.clone(), D=originalLayer.D.clone(),
             dt_bias=dt_proj_bias, delta_softplus=True,
             ssm_state_scale=act_scales["ssm_state_act:input"],
-            u_scale=act_scales["x_proj:input"],
+            # with per-token u scales from the conv kernel, the per-tensor u_scale is unused
+            u_scale=act_scales["u_scan:input" if u_scan_static else "x_proj:input"],
             dt_scale=act_scales["dt_proj:output"],
             B_scale=act_scales["x_proj:output"],
             C_scale=act_scales["x_proj:output"],
@@ -1213,7 +1234,12 @@ class W8A8QMamba(nn.Module):
             # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
             # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
             conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-        x = self.conv1d.forward(x)
+        u_tok_scales = None
+        if self.u_scan_split:
+            x, u_scan, u_tok_scales = self.conv1d.forward(x) # u once per consumer
+        else:
+            x = self.conv1d.forward(x)
+            u_scan = x
 
         # Compute dt, B, C
         x_reshape = rearrange(x, "b d l -> b l d").contiguous()
@@ -1226,7 +1252,8 @@ class W8A8QMamba(nn.Module):
         C = rearrange(C, "b l dstate -> b dstate l", l=seqlen).contiguous()
         
         # SSM step and return ssm_state
-        y = self.selective_scan.forward(x, dt, B, C, z=z, return_last_state=ssm_state is not None)
+        y = self.selective_scan.forward(u_scan, dt, B, C, z=z, return_last_state=ssm_state is not None,
+                                        u_tok_scales=u_tok_scales)
         if ssm_state is not None:
             y, last_state = y # y: fp16, last_state: fp32
             ssm_state.copy_(last_state) # last_state: fp32 copy to ssm_state: fp16
@@ -1237,6 +1264,8 @@ class W8A8QMamba(nn.Module):
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
+        if self.u_scan_split:
+            raise NotImplementedError("W8A8QMamba with u_scan_split has no decoding step yet")
         dtype = hidden_states.dtype
         assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
 

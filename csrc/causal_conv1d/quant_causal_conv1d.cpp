@@ -23,6 +23,9 @@ void quant_causal_conv1d_channellast_fwd_cuda(QuantConvParamsBase &params, cudaS
 template<typename input_t, typename weight_t>
 void quant_causal_conv1d_update_cuda(QuantConvParamsBase &params, cudaStream_t stream);
 
+template<typename input_t, typename weight_t>
+void quant_causal_conv1d_dual_fwd_cuda(QuantConvDualParams &params, cudaStream_t stream);
+
 
 
 void set_conv_params_fwd(QuantConvParamsBase &params,
@@ -164,6 +167,75 @@ quant_causal_conv1d_fwd(
 }
 
 
+// Returns {out, out2, scales}: out at scale_out (the x_proj input), out2 for the selective scan at
+// scale_out2 (group_size == 0, scales is empty) or at per-token scales over groups of group_size
+// channels (32, 64 or 128), scales of shape (batch, dim / group_size, seqlen).
+std::vector<at::Tensor>
+quant_causal_conv1d_dual_fwd(
+    const at::Tensor &x, const float &scale_x,
+    const at::Tensor &weight, const float &scale_w,
+    const float &scale_out, const float &scale_b,
+    const c10::optional<at::Tensor> &bias_,
+    const float &scale_out2, const int64_t &group_size,
+    bool silu_activation
+) {
+    TORCH_CHECK(x.scalar_type() == at::ScalarType::Char);
+    TORCH_CHECK(weight.scalar_type() == at::ScalarType::Char);
+    TORCH_CHECK(x.is_cuda());
+    TORCH_CHECK(weight.is_cuda());
+
+    const auto sizes = x.sizes();
+    const int batch_size = sizes[0];
+    const int dim = sizes[1];
+    const int seqlen = sizes[2];
+    const int width = weight.size(-1);
+
+    CHECK_SHAPE(x, batch_size, dim, seqlen);
+    CHECK_SHAPE(weight, dim, width);
+    TORCH_CHECK(x.stride(2) == 1, "quant_causal_conv1d_dual_fwd only supports the sequence-last layout");
+    TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
+    TORCH_CHECK(group_size == 0 || group_size == 32 || group_size == 64 || group_size == 128,
+                "group_size must be 0 (static second scale), 32, 64 or 128");
+    const int tile = group_size == 0 ? 64 : group_size;
+    TORCH_CHECK(dim % tile == 0, "dim must be divisible by ", tile);
+    if (bias_.has_value()) {
+        auto bias = bias_.value();
+        TORCH_CHECK(bias.scalar_type() == weight.scalar_type());
+        TORCH_CHECK(bias.is_cuda());
+        TORCH_CHECK(bias.stride(-1) == 1);
+        CHECK_SHAPE(bias, dim);
+    }
+
+    at::Tensor out = torch::empty({batch_size, dim, seqlen}, x.options());
+    at::Tensor out2 = torch::empty({batch_size, dim, seqlen}, x.options());
+    at::Tensor scales = group_size == 0 ? torch::empty({0}, x.options().dtype(at::ScalarType::Float))
+        : torch::empty({batch_size, dim / group_size, seqlen}, x.options().dtype(at::ScalarType::Float));
+
+    QuantConvDualParams params;
+    set_conv_params_fwd(params, batch_size, dim, seqlen, width, x, scale_x, weight, scale_w, out, scale_out, scale_b,
+                        bias_.has_value() ? bias_.value().data_ptr() : nullptr,
+                        silu_activation);
+    params.out2_ptr = out2.data_ptr();
+    params.out2_batch_stride = out2.stride(0);
+    params.out2_c_stride = out2.stride(1);
+    params.out2_l_stride = out2.stride(2);
+    params.scale_out2 = scale_out2;
+    params.group_size = group_size;
+    params.scales_ptr = group_size == 0 ? nullptr : scales.data_ptr();
+    params.scales_batch_stride = group_size == 0 ? 0 : scales.stride(0);
+    params.scales_g_stride = group_size == 0 ? 0 : scales.stride(1);
+
+    at::cuda::CUDAGuard device_guard{(char)x.get_device()};
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    DISPATCH_ITYPE_INTEGRAL(x.scalar_type(), "quant_causal_conv1d_dual_fwd", [&] {
+        DISPATCH_WTYPE_INTEGRAL(weight.scalar_type(), "quant_causal_conv1d_dual_fwd", [&] {
+            quant_causal_conv1d_dual_fwd_cuda<input_t, weight_t>(params, stream);
+        });
+    });
+    return {out, out2, scales};
+}
+
+
 at::Tensor
 quant_causal_conv1d_update(const at::Tensor &x,
                      const at::Tensor &conv_state, const float &scale_x,
@@ -228,4 +300,5 @@ quant_causal_conv1d_update(const at::Tensor &x,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fwd", &quant_causal_conv1d_fwd, "Quantized causal conv1d forward");
     m.def("update", &quant_causal_conv1d_update, "Quantized causal conv1d update");
+    m.def("fwd_dual", &quant_causal_conv1d_dual_fwd, "Quantized causal conv1d forward, u written once per consumer");
 }

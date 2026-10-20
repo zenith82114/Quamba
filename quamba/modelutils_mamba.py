@@ -171,9 +171,13 @@ def get_calibration_data(tokenizer, dataset, num_samples, seq_len, seed, device)
 def run_quamba_calibration(
         model, model_type, tokenizer, num_samples=512, seq_len=512,
         calibration_dataset=None, preprocess_fn=None,
-        act_observer="quamba", hist_percentile=0.999999
+        act_observer="quamba", hist_percentile=0.999999,
+        u_percentile=None, u_scan_percentile=None
     ):
     """
+    u_percentile: the quantile of Quamba's percentile observer at the conv output (x_proj input), default 0.9995.
+    u_scan_percentile: also calibrate "u_scan:input", a separate static scale for the selective scan's u,
+                       with Quamba's percentile observer at this quantile (Mamba1 only).
     act_observer="quamba": Quamba's recipe, symmetric running absmax, except an EMA of the per-sample
                            percentile at the conv output (x_proj input) and the SSM state.
     act_observer="hist": MambaQuant's pooled-histogram percentile (hist_percentile) for every activation,
@@ -215,6 +219,8 @@ def run_quamba_calibration(
         if isinstance(outputs, tuple):
             outputs = outputs[0]
         observers[block_idx][op + ":output"].update(outputs.clone().detach())
+        if op + ":input.scan" in observers[block_idx]: # the same u, at the selective scan's quantile
+            observers[block_idx][op + ":input.scan"].update(inputs.clone().detach())
 
     hooks = []
     for i in range(len(layers)):
@@ -226,6 +232,10 @@ def run_quamba_calibration(
             if is_calib_ops(m):
                 op = name.split(".")[0]
                 observers[i][op + ":input"] = make_observer(percentile=is_x(op) or is_ssm_state(op))
+                if is_x(op) and u_percentile is not None:
+                    observers[i][op + ":input"] = make_observer(percentile=True, percentile_alpha=u_percentile)
+                if is_x(op) and u_scan_percentile is not None:
+                    observers[i][op + ":input.scan"] = make_observer(percentile=True, percentile_alpha=u_scan_percentile)
                 observers[i][op + ":output"] = make_observer()
                 hooks.append(
                     m.register_forward_hook(partial(stat_hook, op=op, block_idx=i))
@@ -249,6 +259,8 @@ def run_quamba_calibration(
             scale, base = observer.get_quantization_parameters()
             # FIXME (HY): hardcode to not use base now
             act_scales[i][name] = scale.to(torch.float32)
+        if "x_proj:input.scan" in act_scales[i]:
+            act_scales[i]["u_scan:input"] = act_scales[i].pop("x_proj:input.scan")
     del observers
     return act_scales
 
@@ -545,7 +557,7 @@ def quantize_norm_a8(block_type, norm, layer_idx, act_scales, device):
         output_scale=act_scales[layer_idx]["in_proj:input"].item())
     return norm.to(device)
 
-def quantize_mixer_w8a8(block_type, mixer, layer_idx, act_scales, device):
+def quantize_mixer_w8a8(block_type, mixer, layer_idx, act_scales, device, u_scan_group_size=0):
     W8A8Mixers = {
         "Mamba": W8A8QMamba,
         "Mamba2": W8A8QMamba2,
@@ -554,10 +566,11 @@ def quantize_mixer_w8a8(block_type, mixer, layer_idx, act_scales, device):
         raise ValueError(f"Not find {block_type} in W8A8 Mixer")
     if W8A8Mixers[block_type] is None:
         raise ValueError(f"Not support {block_type} with W8A8")
+    u_scan = {"u_scan_group_size": u_scan_group_size} if u_scan_group_size else {} # Mamba1 only
     mixer = W8A8Mixers[block_type].from_fp16(
                 originalLayer=mixer,
                 act_scales=act_scales[layer_idx],
-                use_had_transform=True)
+                use_had_transform=True, **u_scan)
     return mixer.to(device)
 
 def quantize_mixer_w4a16(block_type, mixer, layer_idx, act_scales, device):
@@ -587,7 +600,7 @@ def quantize_mixer_w4a8(block_type, mixer, layer_idx, act_scales, device):
                 use_had_transform=True)
     return mixer.to(device)
 
-def get_quantize_block_fn(act_scales, w_bits, a_bits, device):
+def get_quantize_block_fn(act_scales, w_bits, a_bits, device, u_scan_group_size=0):
     if w_bits == 4 and a_bits == 8:
         quantize_norm_fn = partial(quantize_norm_a8, act_scales=act_scales, device=device)
         quantize_mixer_fn = partial(quantize_mixer_w4a8, act_scales=act_scales, device=device)
@@ -596,16 +609,18 @@ def get_quantize_block_fn(act_scales, w_bits, a_bits, device):
         quantize_mixer_fn = partial(quantize_mixer_w4a16, act_scales=act_scales, device=device)
     elif w_bits == 8 and a_bits == 8:
         quantize_norm_fn = partial(quantize_norm_a8, act_scales=act_scales, device=device)
-        quantize_mixer_fn = partial(quantize_mixer_w8a8, act_scales=act_scales, device=device)
+        quantize_mixer_fn = partial(quantize_mixer_w8a8, act_scales=act_scales, device=device,
+                                    u_scan_group_size=u_scan_group_size)
     else:
         raise ValueError(f"Unsupport w{w_bits}a{a_bits}, only w8a8, w4a8, and w4a16 are supported")
     return quantize_norm_fn, quantize_mixer_fn
 
 @torch.no_grad()
-def quantize_fp16_model(model, model_type, act_scales, device, w_bits=4, a_bits=8, quantize_embedding=True, quantize_lm_head=True):
+def quantize_fp16_model(model, model_type, act_scales, device, w_bits=4, a_bits=8, quantize_embedding=True, quantize_lm_head=True,
+                        u_scan_group_size=0):
     assert w_bits in [4, 8], "Only support 4 or 8 bits weights for now"
     assert a_bits in [8, 16], "Only support 8 or 16 bits activations for now"
-    quantize_norm_fn, quantize_mixer_fn = get_quantize_block_fn(act_scales, w_bits, a_bits, device)
+    quantize_norm_fn, quantize_mixer_fn = get_quantize_block_fn(act_scales, w_bits, a_bits, device, u_scan_group_size)
 
     model.config.use_cache = False
     if model_type == "mamba":
@@ -886,6 +901,14 @@ def get_calib_suffix(args):
         suffix += f"-{args.act_observer}{args.hist_percentile:g}"
     if args.asym_act:
         suffix += "-asym"
+    u_percentile = getattr(args, "fq_u_percentile", None)
+    u_scan_percentile = getattr(args, "fq_u_scan_percentile", None)
+    if u_percentile is not None:
+        suffix += f"-u{u_percentile:g}"
+    if getattr(args, "fq_u_scan_dynamic", False):
+        suffix += f"-uscan-dyn-g{args.fq_u_scan_group_size}"
+    elif u_scan_percentile is not None:
+        suffix += f"-uscan{u_scan_percentile:g}"
     return suffix
 
 
@@ -952,6 +975,14 @@ def check_quantized_model_config(quantized_model_path, model_type, args):
             f"these settings in the directory name. Delete or rename it to quantize again.")
 
 
+def check_real_u_scan_args(model_type, args):
+    """The real kernels take --fq_u_percentile, --fq_u_scan_percentile and --fq_u_scan_dynamic on W8A8 Mamba1."""
+    if args.fq_u_percentile is None and args.fq_u_scan_percentile is None and not args.fq_u_scan_dynamic:
+        return
+    if model_type != "mamba" or (args.w_bits, args.a_bits) != (8, 8) or args.hybrid_blocks or args.group_heads:
+        raise NotImplementedError("Real kernels support --fq_u_* only for W8A8 Mamba1")
+
+
 def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration_dataset=None, calib_preprocess_fn=None):
     if getattr(args, "fake_quant", False):
         return fake_quantize_model_mamba(model, model_type, tokenizer, device, args,
@@ -984,6 +1015,7 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
         else:
             logging.warning(f"Unsupported model {args.model} in ut-enyac/ model registry")
 
+    check_real_u_scan_args(model_type, args)
     # replace the mamba blocks with simple blocks to get the scaling factors
     # we hardcode use_had_transform=True to fix the configuration, so it is easier for users
     model = configure_model(model, model_type, use_had_transform=True) # W4A16 needs had_transform as well
@@ -1013,7 +1045,9 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
                                                 calibration_dataset=calibration_dataset,
                                                 preprocess_fn=calib_preprocess_fn,
                                                 act_observer=args.act_observer,
-                                                hist_percentile=args.hist_percentile)
+                                                hist_percentile=args.hist_percentile,
+                                                u_percentile=args.fq_u_percentile,
+                                                u_scan_percentile=None if args.fq_u_scan_dynamic else args.fq_u_scan_percentile)
     elif args.a_bits == 16:
         # not doing anything for activations
         act_scales = {}
@@ -1047,7 +1081,8 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
             model, model_type, act_scales, device,
             w_bits=args.w_bits, a_bits=args.a_bits,
             quantize_embedding=args.quantize_embedding,
-            quantize_lm_head=args.quantize_lm_head
+            quantize_lm_head=args.quantize_lm_head,
+            u_scan_group_size=args.fq_u_scan_group_size if args.fq_u_scan_dynamic else 0,
         )
     # store the state_dict if not quamba
     model_name = args.model.lower().split('/')[-1]
@@ -1058,6 +1093,10 @@ def quantize_model_mamba(model, model_type, tokenizer, device, args, calibration
         if not args.hybrid_blocks:
             # we slightly hack the api: we use MambaLMHeadModel instead of QuambaLMHeadModel to store the model here
             model.config.ssm_cfg['layer'] = model.backbone.layers[0].mixer.__class__.__name__
+            mixer = model.backbone.layers[0].mixer
+            if getattr(mixer, "u_scan_split", False): # rebuilt from the config when loading
+                model.config.ssm_cfg['u_scan_split'] = True
+                model.config.ssm_cfg['u_scan_group_size'] = mixer.u_scan_group_size
             model.config.norm_cfg = {"norm": model.backbone.layers[0].norm.__class__.__name__}
             model.config.embedding_cfg = {"layer": model.backbone.embedding.__class__.__name__}
             model.config.lm_head_cfg = {"layer": model.lm_head.__class__.__name__}
